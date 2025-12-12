@@ -1,0 +1,797 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import datetime as dt
+import requests
+import json
+import urllib3
+
+# Desativa avisos SSL (apenas para testes)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==================== Config Visual (Tema Pro) ====================
+class Theme:
+    APP_BG = "#F3F4F8"  # fundo da aplicação
+    SURFACE = "#FFFFFF"  # cartões/painéis
+    TEXT = "#0F172A"     # texto principal
+    MUTED = "#6B7280"    # texto secundário
+    BORDER = "#E5E7EB"   # linhas suaves
+    PRIMARY = "#EF4444"  # vermelho (reservado)
+    SUCCESS = "#2563EB"  # azul (limpeza)
+    WARNING = "#F59E0B"  # laranja (interditado)
+    NEUTRAL = "#10B981"  # verde (disponível)
+    MAGENTA = "#C2185B"  # badge Feminino
+
+STATUS = ["DISPONÍVEL", "RESERVADO", "INTERDITADO", "LIMPEZA"]
+
+def maximize_window(win):
+    try: win.state("zoomed")
+    except: pass
+    try: win.attributes("-zoomed", True)
+    except: pass
+    w, h = win.winfo_screenwidth(), win.winfo_screenheight()
+    win.geometry(f"{w}x{h}+0+0")
+
+# ==================== Modelo (Quarto com 2 camas) ====================
+class Cama:
+    def __init__(self, idx, status="DISPONÍVEL", female_only=False, note=""):
+        self.idx = idx  # "A" ou "B"
+        self.status = status
+        self.female_only = bool(female_only)
+        self.note = note
+        self.reservation = None  # {"nome","matricula","gerencia","obs","obs_blink","check_in","check_out"}
+
+    @property
+    def available(self): return self.status == "DISPONÍVEL"
+    @property
+    def reserved(self): return self.status == "RESERVADO"
+    @property
+    def interdited(self): return self.status == "INTERDITADO"
+    @property
+    def cleaning(self): return self.status == "LIMPEZA"
+
+class Quarto:
+    def __init__(self, number, female_only=False):
+        self.number = str(number)  # 1..32
+        self.camas = {
+            "A": Cama("A", female_only=female_only),
+            "B": Cama("B", female_only=female_only),
+        }
+
+def seed_quartos(fem_set=None):
+    # Defina aqui os "quartos femininos" (impacta A e B)
+    if fem_set is None:
+        fem_set = {29, 30, 31, 32}  # 4 quartos femininos por padrão
+    quartos = {}
+    for no in range(1, 33):  # 32 quartos
+        q = Quarto(no, female_only=(no in fem_set))
+        quartos[str(no)] = q
+    # Estados iniciais (exemplos aplicados à cama A)
+    preset = {1: "RESERVADO", 2: "INTERDITADO", 3: "LIMPEZA"}
+    for no, st in preset.items():
+        if str(no) in quartos:
+            quartos[str(no)].camas["A"].status = st
+    return quartos
+
+# ==================== Firebase ====================
+BASE_URL = "https://hospedagem-18602-default-rtdb.firebaseio.com/hospedagem"
+
+def quartos_to_dict(quartos):
+    data = {}
+    for qnum, q in quartos.items():
+        data[qnum] = {
+            "number": q.number,
+            "camas": {}
+        }
+        for cid, c in q.camas.items():
+            data[qnum]["camas"][cid] = {
+                "idx": c.idx,
+                "status": c.status,
+                "female_only": c.female_only,
+                "note": c.note,
+                "reservation": c.reservation
+            }
+    return data
+
+def dict_to_quartos(data):
+    quartos = {}
+    if not data:
+        return quartos  # Retorna vazio se não houver dados
+
+    if isinstance(data, list):
+        for idx, qd in enumerate(data):
+            if qd and "number" in qd:
+                qnum = str(qd["number"])
+                q = Quarto(qnum)
+                for cid, cd in qd.get("camas", {}).items():
+                    c = q.camas[cid]
+                    c.status = cd.get("status", "DISPONÍVEL")
+                    c.female_only = cd.get("female_only", False)
+                    c.note = cd.get("note", "")
+                    c.reservation = cd.get("reservation", None)
+                quartos[qnum] = q
+    else:
+        for qnum, qd in data.items():
+            q = Quarto(qnum)
+            for cid, cd in qd.get("camas", {}).items():
+                c = q.camas[cid]
+                c.status = cd.get("status", "DISPONÍVEL")
+                c.female_only = cd.get("female_only", False)
+                c.note = cd.get("note", "")
+                c.reservation = cd.get("reservation", None)
+            quartos[str(qnum)] = q
+    return quartos
+
+
+
+
+def carregar_quartos_firebase():
+    try:
+        r = requests.get(f"{BASE_URL}.json", timeout=10, verify=False)
+        r.raise_for_status()
+        data = r.json()
+        return dict_to_quartos(data)
+    except Exception as e:
+        print("Erro ao carregar quartos do Firebase:", e)
+        return seed_quartos()
+
+def salvar_quartos_firebase(quartos):
+    try:
+        data = quartos_to_dict(quartos)
+        r = requests.put(f"{BASE_URL}.json", json=data, timeout=10, verify=False)
+        r.raise_for_status()
+        print("Salvo com sucesso!")
+    except Exception as e:
+        print("Erro ao salvar quartos no Firebase:", e)
+
+# ==================== App ====================
+class HospedagemPro(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("• Gestão de Hospedagem ")
+        maximize_window(self)
+        self.configure(bg=Theme.APP_BG)
+
+        # Carregar quartos do Firebase
+        self.quartos = carregar_quartos_firebase()
+        self.filtered = None
+
+        self._build_style()
+        self._build_appbar()
+        self._build_notebook()
+        self._build_tab_rooms()
+        self._build_tab_performance()
+
+        # Salva ao fechar
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def on_closing(self):
+        salvar_quartos_firebase(self.quartos)
+        self.destroy()
+
+    # ---------- Styles ----------
+    def _build_style(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure("AppBar.TFrame", background=Theme.SURFACE)
+        s.configure("AppBar.TLabel", background=Theme.SURFACE, foreground=Theme.TEXT, font=("Segoe UI", 12, "bold"))
+        s.configure("Main.TFrame", background=Theme.APP_BG)
+        s.configure("Panel.TFrame", background=Theme.SURFACE)
+        s.configure("Panel.TLabel", background=Theme.SURFACE, foreground=Theme.TEXT, font=("Segoe UI", 10))
+        s.configure("TNotebook", background=Theme.APP_BG, borderwidth=0)
+        s.configure("TNotebook.Tab", padding=[14, 8], font=("Segoe UI", 10, "bold"))
+        s.map("TNotebook.Tab",
+              background=[("selected", Theme.SURFACE), ("!selected", "#E5E7EB")],
+              foreground=[("selected", Theme.TEXT), ("!selected", Theme.MUTED)])
+        s.configure("Search.TEntry", padding=8)
+        s.configure("Primary.TButton", padding=8, font=("Segoe UI", 10, "bold"))
+        s.map("Primary.TButton",
+              background=[("!disabled", Theme.PRIMARY), ("active", "#1E40AF")],
+              foreground=[("!disabled", "#FFFFFF")])
+        s.configure("KPI.TFrame", background=Theme.SURFACE, relief="solid", borderwidth=1)
+        s.configure("KPI.Title.TLabel", background=Theme.SURFACE, foreground=Theme.MUTED, font=("Segoe UI", 9))
+        s.configure("KPI.Value.TLabel", background=Theme.SURFACE, foreground=Theme.TEXT, font=("Segoe UI", 18, "bold"))
+
+    # ---------- AppBar ----------
+    def _build_appbar(self):
+        bar = ttk.Frame(self, style="AppBar.TFrame")
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Controle Hospedagem", style="AppBar.TLabel").pack(side="left", padx=16, pady=10)
+        right = ttk.Frame(bar, style="AppBar.TFrame")
+        right.pack(side="right", padx=16, pady=10)
+        ttk.Button(right, text="Atualizar", style="Primary.TButton", command=self._refresh_all).pack(side="right")
+
+    # ---------- Notebook ----------
+    def _build_notebook(self):
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=16, pady=16)
+        self.tab_rooms = ttk.Frame(self.nb, style="Main.TFrame")
+        self.tab_perf = ttk.Frame(self.nb, style="Main.TFrame")
+        self.nb.add(self.tab_rooms, text="🛏️ Quartos")
+        self.nb.add(self.tab_perf, text="📈 Desempenho")
+
+    # ---------- TAB: Quartos ----------
+    def _build_tab_rooms(self):
+        top = ttk.Frame(self.tab_rooms, style="Panel.TFrame")
+        top.pack(fill="x")
+        ttk.Label(top, text="Pesquisar", style="Panel.TLabel").pack(side="left", padx=16, pady=10)
+        self.search_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.search_var, style="Search.TEntry", width=40).pack(side="left", padx=8, pady=10)
+        ttk.Button(top, text="Buscar", style="Primary.TButton", command=self._apply_filter).pack(side="left", padx=8)
+        ttk.Button(top, text="Limpar", command=self._clear_filter).pack(side="left", padx=8)
+
+        kpi = ttk.Frame(self.tab_rooms, style="Main.TFrame")
+        kpi.pack(fill="x", pady=(12, 0))
+        self.kpi_labels = {}
+        for title in ["Disponíveis", "Reservados", "Interditados", "Limpeza", "Femininos"]:
+            card = ttk.Frame(kpi, style="KPI.TFrame")
+            card.pack(side="left", padx=8, ipadx=16, ipady=8)
+            ttk.Label(card, text=title, style="KPI.Title.TLabel").pack(anchor="w")
+            val = ttk.Label(card, text="0", style="KPI.Value.TLabel")
+            val.pack(anchor="w")
+            self.kpi_labels[title] = val
+
+        container = ttk.Frame(self.tab_rooms, style="Main.TFrame")
+        container.pack(fill="both", expand=True, pady=12)
+        canvas = tk.Canvas(container, background=Theme.APP_BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        self.grid = ttk.Frame(canvas, style="Main.TFrame")
+        self.grid.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.grid, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self._render_quarto_cards()
+        self._update_kpis()
+
+    # ---------- TAB: Desempenho ----------
+    def _build_tab_performance(self):
+        header = ttk.Frame(self.tab_perf, style="Panel.TFrame")
+        header.pack(fill="x")
+        ttk.Label(header, text="Indicadores de Desempenho", style="AppBar.TLabel").pack(side="left", padx=16, pady=10)
+        ttk.Button(header, text="Atualizar", style="Primary.TButton", command=self._refresh_desempenho).pack(side="left", padx=8, pady=10)
+
+        resume = ttk.Frame(self.tab_perf, style="Main.TFrame")
+        resume.pack(fill="x", pady=(12, 4), padx=8)
+        self.lbl_resumo = {}
+        items = ["Total de Quartos", "Total de Vagas", "Disponíveis", "Reservados", "Interditados", "Em Limpeza", "Femininos"]
+        for title in items:
+            card = ttk.Frame(resume, style="KPI.TFrame")
+            card.pack(side="left", padx=8, ipadx=16, ipady=8)
+            ttk.Label(card, text=title, style="KPI.Title.TLabel").pack(anchor="w")
+            val = ttk.Label(card, text="—", style="KPI.Value.TLabel")
+            val.pack(anchor="w")
+            self.lbl_resumo[title] = val
+
+        table_box = ttk.Frame(self.tab_perf, style="Panel.TFrame")
+        table_box.pack(fill="both", expand=True, padx=8, pady=8)
+        ttk.Label(table_box, text="Reservas (Quarto • Cama / Nome / Matrícula / Gerência)", style="Panel.TLabel",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(12, 6))
+        self.table = ttk.Treeview(table_box, columns=("Vaga","Nome","Matrícula","Gerência"), show="headings", height=14)
+        for col, w in [("Vaga",120),("Nome",200),("Matrícula",140),("Gerência",160)]:
+            self.table.heading(col, text=col)
+            self.table.column(col, width=w, anchor="center" if col=="Vaga" else "w")
+        self.table.pack(fill="both", expand=True, padx=12, pady=(0,12))
+        self._refresh_desempenho()
+
+    # ---------- Filtro / Refresh ----------
+    def _apply_filter(self):
+        q = self.search_var.get().strip().lower()
+        self.filtered = None if not q else set()
+        for qkey, quarto in self.quartos.items():
+            match = False
+            for c in quarto.camas.values():
+                hay = " ".join([
+                    quarto.number, c.idx, c.status, c.note or "",
+                    (c.reservation or {}).get("nome",""),
+                    (c.reservation or {}).get("matricula",""),
+                    (c.reservation or {}).get("gerencia",""),
+                    (c.reservation or {}).get("obs",""),
+                ]).lower()
+                if not q or q in hay:
+                    match = True
+                    break
+            if match and self.filtered is not None:
+                self.filtered.add(qkey)
+        self._render_quarto_cards()
+        self._update_kpis()
+        self._refresh_desempenho()
+
+    def _clear_filter(self):
+        self.search_var.set("")
+        self.filtered = None
+        self._render_quarto_cards()
+        self._update_kpis()
+        self._refresh_desempenho()
+
+    def _refresh_all(self):
+        self._render_quarto_cards()
+        self._update_kpis()
+        self._refresh_desempenho()
+
+    # ---------- Render Cards (por Quarto, com Cama A/B) ----------
+    def _status_color_cama(self, c: Cama):
+        if c.reserved: return Theme.PRIMARY
+        if c.interdited: return Theme.WARNING
+        if c.cleaning: return Theme.SUCCESS
+        if c.available: return Theme.NEUTRAL
+        return Theme.NEUTRAL
+
+    def _render_quarto_cards(self):
+        for child in self.grid.winfo_children():
+            child.destroy()
+        keys = sorted(self.quartos.keys(), key=lambda k: int(k))
+        if self.filtered is not None:
+            keys = [k for k in keys if k in self.filtered]
+        cols = 6  # ajuste de quantos cards por linha
+        for idx, key in enumerate(keys):
+            q = self.quartos[key]
+            row = idx // cols
+            col = idx % cols
+            self._quarto_card(self.grid, q).grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
+        for c in range(cols):
+            self.grid.grid_columnconfigure(c, weight=1)
+
+    def _quarto_card(self, parent, q: Quarto):
+        card = tk.Frame(parent, bg=Theme.SURFACE, bd=0, highlightthickness=1,
+                        highlightbackground=Theme.BORDER, width=210, height=160)
+        card.pack_propagate(False)
+
+        # Cabeçalho do quarto
+        header = tk.Frame(card, bg=Theme.SURFACE)
+        header.pack(fill="x", padx=10, pady=(8,4))
+
+        tk.Label(header, text=f"Quarto {q.number}", bg=Theme.SURFACE, fg=Theme.TEXT,
+                 font=("Segoe UI", 11, "bold")).pack(side="left")
+
+        # ---------- OBS por Quarto (badge no cabeçalho) ----------
+        hdr_right = tk.Frame(header, bg=Theme.SURFACE)
+        hdr_right.pack(side="right")
+
+        # Agrega estado de OBS no nível de quarto
+        room_has_obs = any(
+            ((c.reservation or {}).get("obs", "").strip())
+            for c in q.camas.values()
+        )
+        room_blink_on = any(
+            bool((c.reservation or {}).get("obs_blink", False))
+            for c in q.camas.values()
+        )
+
+        if room_has_obs:
+            obs_room_badge = tk.Label(
+                hdr_right, text="OBS", bg=Theme.WARNING, fg="#FFFFFF",
+                font=("Segoe UI", 8, "bold"), padx=6, pady=2, cursor="hand2"
+            )
+            obs_room_badge.pack(side="right", padx=(6,0))
+            # Clique abre resumo de observações do quarto
+            obs_room_badge.bind("<Button-1>", lambda e, quarto=q: self._show_obs_quarto(quarto))
+            # Piscar se qualquer cama estiver com obs_blink=True
+            if room_blink_on:
+                obs_room_badge._blink_state = False
+                def _blink_room():
+                    obs_room_badge._blink_state = not getattr(obs_room_badge, "_blink_state", False)
+                    new_bg = Theme.WARNING if obs_room_badge._blink_state else "#FBD38D"
+                    try:
+                        obs_room_badge.configure(bg=new_bg)
+                    except tk.TclError:
+                        return
+                    obs_room_badge._blink_after_id = obs_room_badge.after(800, _blink_room)
+                _blink_room()
+                def _stop_blink_room(_e=None):
+                    after_id = getattr(obs_room_badge, "_blink_after_id", None)
+                    if after_id:
+                        try: obs_room_badge.after_cancel(after_id)
+                        except: pass
+                obs_room_badge.bind("<Destroy>", _stop_blink_room)
+
+        body = tk.Frame(card, bg=Theme.SURFACE)
+        body.pack(fill="both", expand=True, padx=10, pady=(0,8))
+
+        for idx, cama_id in enumerate(["A","B"]):
+            c = q.camas[cama_id]
+            slot = tk.Frame(body, bg=Theme.SURFACE, highlightthickness=1,
+                            highlightbackground=Theme.BORDER)
+            slot.grid(row=0, column=idx, sticky="nsew", padx=(0 if idx==0 else 6), pady=0)
+
+            # Barra de status por cama
+            tk.Frame(slot, bg=self._status_color_cama(c), height=6).pack(fill="x", side="top")
+
+            inner = tk.Frame(slot, bg=Theme.SURFACE)
+            inner.pack(fill="both", expand=True, padx=8, pady=6)
+
+            # Título cama
+            top_row = tk.Frame(inner, bg=Theme.SURFACE)
+            top_row.pack(fill="x")
+            tk.Label(top_row, text=f"Cama {cama_id}", bg=Theme.SURFACE, fg=Theme.MUTED,
+                     font=("Segoe UI", 9, "bold")).pack(side="left")
+            if c.female_only:
+                tk.Label(top_row, text="Feminino", bg=Theme.MAGENTA, fg="#FFFFFF",
+                         font=("Segoe UI", 8, "bold"), padx=6, pady=2).pack(side="right")
+
+            # Nome/gerência se houver reserva
+            res = c.reservation or {}
+            nome = res.get("nome","").strip()
+            if nome:
+                tk.Label(inner, text=nome, bg=Theme.SURFACE, fg=Theme.PRIMARY,
+                         font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(4,2))
+            ger = res.get("gerencia","").strip()
+            if ger:
+                tk.Label(inner, text=ger, bg="#EEF2FF", fg=Theme.PRIMARY,
+                         font=("Segoe UI", 9), padx=6, pady=2).pack(anchor="w", pady=(0,6))
+
+            # Status + nota
+            tk.Label(inner, text=c.status, bg=Theme.SURFACE, fg=Theme.MUTED,
+                     font=("Segoe UI", 9)).pack(anchor="w")
+            if c.note:
+                tk.Label(inner, text=c.note, bg=Theme.SURFACE, fg=Theme.TEXT,
+                         font=("Segoe UI", 9)).pack(anchor="w")
+
+            # >>> Interações: clique abre SEMPRE a janela "Ações Vaga", posicionada pelo cursor
+            def on_left_click(e, quarto=q, cama=c):
+                try:
+                    self._open_actions_cama(quarto, cama, anchor=(e.x_root, e.y_root))
+                except Exception as ex:
+                    messagebox.showerror("Erro ao abrir ações", str(ex))
+
+            # Bind em TODAS as áreas do card
+            for t in [card, header, body, slot, inner, top_row]:
+                t.bind("<Button-1>", on_left_click)
+
+            # Menu direito por cama
+            menu = tk.Menu(slot, tearoff=0)
+            menu.add_command(label="Reservar...", command=lambda quarto=q, cama=c: self._open_reservation_tab(quarto, cama, mode="new"))
+            if c.reservation:
+                menu.add_command(label="Editar reserva...", command=lambda quarto=q, cama=c: self._open_reservation_tab(quarto, cama, mode="edit"))
+            menu.add_separator()
+            menu.add_command(label="Liberar", command=lambda quarto=q, cama=c: self._set_status_cama(quarto, cama, "DISPONÍVEL"))
+            menu.add_command(label="Interditado", command=lambda quarto=q, cama=c: self._set_status_cama(quarto, cama, "INTERDITADO"))
+            menu.add_command(label="Limpeza", command=lambda quarto=q, cama=c: self._set_status_cama(quarto, cama, "LIMPEZA"))
+            for t in [slot, inner, top_row]:
+                t.bind("<Button-3>", lambda e, m=menu: (m.tk_popup(e.x_root, e.y_root), m.grab_release()))
+
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+
+        # Hover
+        def on_enter(_e):
+            card.configure(highlightbackground="#CBD5E1")
+        def on_leave(_e):
+            card.configure(highlightbackground=Theme.BORDER)
+        for t in [card, header, body]:
+            t.bind("<Enter>", on_enter); t.bind("<Leave>", on_leave)
+        return card
+
+    # ---------- Ações por Cama ----------
+    def _open_actions_cama(self, q: Quarto, c: Cama, anchor=None, modal=False):
+        win = tk.Toplevel(self)
+        win.title(f"Ações Quarto {q.number} • Cama {c.idx}")
+        win.transient(self)
+        win.deiconify()
+
+        # Posicionar próximo ao cursor (se disponível)
+        if anchor is not None:
+            ax, ay = anchor
+            ax = max(0, ax - 200)
+            ay = max(0, ay - 120)
+            win.geometry(f"+{ax}+{ay}")
+
+        # Trazer para frente e focar (topmost breve)
+        try:
+            win.attributes("-topmost", True)
+            win.after(150, lambda: win.attributes("-topmost", False))
+        except:
+            pass
+        win.lift()
+        win.focus_force()
+
+        # Modal opcional (desativado por padrão para evitar travamentos/demora)
+        if modal:
+            try:
+                win.grab_set()
+                self.wait_window(win)
+            except:
+                pass
+
+        hdr = ttk.Frame(win, style="Panel.TFrame"); hdr.pack(fill="x")
+        ttk.Label(hdr, text=f"Quarto {q.number} • Cama {c.idx}", style="AppBar.TLabel").pack(anchor="w", padx=12, pady=(12,4))
+        ttk.Label(hdr, text=f"Status atual: {c.status}", style="Panel.TLabel").pack(anchor="w", padx=12, pady=(0,8))
+
+        actions = ttk.Frame(win, style="Panel.TFrame"); actions.pack(padx=12, pady=12)
+        ttk.Button(actions, text="Reservar...", style="Primary.TButton",
+                   command=lambda: (self._open_reservation_tab(q, c, mode="new"), win.destroy())).grid(row=0, column=0, padx=6, pady=6)
+        ttk.Button(actions, text="Editar reserva...",
+                   command=lambda: (self._open_reservation_tab(q, c, mode="edit"), win.destroy())).grid(row=0, column=1, padx=6, pady=6)
+        ttk.Button(actions, text="Liberar",
+                   command=lambda: (self._set_status_cama(q, c, "DISPONÍVEL"), win.destroy())).grid(row=0, column=2, padx=6, pady=6)
+        ttk.Button(actions, text="Interditado",
+                   command=lambda: (self._set_status_cama(q, c, "INTERDITADO"), win.destroy())).grid(row=0, column=3, padx=6, pady=6)
+        ttk.Button(actions, text="Limpeza",
+                   command=lambda: (self._set_status_cama(q, c, "LIMPEZA"), win.destroy())).grid(row=0, column=4, padx=6, pady=6)
+
+    def _set_status_cama(self, q: Quarto, c: Cama, new_status: str):
+        if new_status not in STATUS:
+            messagebox.showerror("Status inválido", f"Status '{new_status}' não é permitido.")
+            return
+        c.status = new_status
+        if new_status == "DISPONÍVEL":
+            c.note = ""
+            c.reservation = None
+        salvar_quartos_firebase(self.quartos)
+        self._refresh_all()
+
+    # ---------- Aba de Reserva (por Cama) ----------
+    def _open_reservation_tab(self, quarto: Quarto, cama: Cama, mode: str = "new"):
+        title = f"📝 Reserva — {'Editar' if mode=='edit' else 'Nova'} — Quarto {quarto.number} • Cama {cama.idx}"
+        tab = ttk.Frame(self.nb, style="Main.TFrame")
+        self.nb.add(tab, text=title)
+        self.nb.select(tab)
+
+        form = ttk.Frame(tab, style="Panel.TFrame")
+        form.pack(fill="x")
+        ttk.Label(form, text="Preencha os dados da reserva:", style="AppBar.TLabel") \
+            .grid(row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(12,8))
+
+        reservation = cama.reservation or {}
+        nome_var = tk.StringVar(value=reservation.get("nome",""))
+        matricula_var = tk.StringVar(value=reservation.get("matricula",""))
+        gerencia_var = tk.StringVar(value=reservation.get("gerencia",""))
+        obs_var = tk.StringVar(value=reservation.get("obs",""))
+
+        # Datas (Check-in / Check-out) - formato DD/MM/AAAA
+        checkin_var = tk.StringVar(value=reservation.get("check_in", ""))
+        checkout_var = tk.StringVar(value=reservation.get("check_out", ""))
+
+        # Seleção Quarto/Cama (permite trocar)
+        quarto_var = tk.StringVar(value=quarto.number)
+        cama_var = tk.StringVar(value=cama.idx)
+        quartos_list = [str(i) for i in range(1, 33)]
+        camas_list = ["A","B"]
+
+        def add_row(lbl, var, row, col=0, width=32):
+            ttk.Label(form, text=lbl, style="Panel.TLabel").grid(row=row, column=col, sticky="w", padx=12, pady=8)
+            ttk.Entry(form, textvariable=var, width=width).grid(row=row, column=col+1, sticky="w", padx=(6,18), pady=8)
+
+        def add_date_row(lbl, var, row, col=0, width=16, hint="DD/MM/AAAA"):
+            ttk.Label(form, text=lbl, style="Panel.TLabel").grid(row=row, column=col, sticky="w", padx=12, pady=8)
+            e = ttk.Entry(form, textvariable=var, width=width)
+            e.grid(row=row, column=col+1, sticky="w", padx=(6,18), pady=8)
+            if not var.get().strip():
+                e.insert(0, hint)
+                def on_focus_in(_e, entry=e):
+                    if entry.get() == hint:
+                        entry.delete(0, "end")
+                def on_focus_out(_e, entry=e):
+                    if not entry.get().strip():
+                        entry.insert(0, hint)
+                e.bind("<FocusIn>", on_focus_in)
+                e.bind("<FocusOut>", on_focus_out)
+
+        add_row("Nome", nome_var, 1, 0)
+        add_row("Matrícula", matricula_var, 2, 0)
+        add_row("Gerência", gerencia_var, 3, 0)
+        add_row("Observação", obs_var, 4, 0)
+        add_date_row("Check-in", checkin_var, 5, 0)
+        add_date_row("Check-out", checkout_var, 6, 0)
+
+        ttk.Label(form, text="Escolher Quarto", style="Panel.TLabel").grid(row=1, column=2, sticky="w", padx=12, pady=8)
+        ttk.Combobox(form, textvariable=quarto_var, values=quartos_list, state="readonly", width=12) \
+            .grid(row=1, column=3, sticky="w", padx=(6,18), pady=8)
+        ttk.Label(form, text="Escolher Cama", style="Panel.TLabel").grid(row=2, column=2, sticky="w", padx=12, pady=8)
+        ttk.Combobox(form, textvariable=cama_var, values=camas_list, state="readonly", width=12) \
+            .grid(row=2, column=3, sticky="w", padx=(6,18), pady=8)
+
+        for c in range(0,4):
+            form.grid_columnconfigure(c, weight=1)
+
+        def _parse_br_date(s: str) -> dt.date:
+            s = (s or "").strip()
+            if not s or s == "DD/MM/AAAA":
+                raise ValueError("Informe a data no formato DD/MM/AAAA.")
+            try:
+                return dt.datetime.strptime(s, "%d/%m/%Y").date()
+            except Exception:
+                raise ValueError("Formato de data inválido. Use DD/MM/AAAA.")
+
+        def _validate_dates(ci_str: str, co_str: str):
+            ci = _parse_br_date(ci_str)
+            co = _parse_br_date(co_str)
+            if ci > co:
+                raise ValueError("Check-in não pode ser depois de Check-out.")
+            return ci, co
+
+        actions = ttk.Frame(tab, style="Panel.TFrame")
+        actions.pack(fill="x", padx=12, pady=12)
+
+        def salvar():
+            nome = nome_var.get().strip()
+            if not nome:
+                messagebox.showerror("Validação", "Informe o Nome.")
+                return
+
+            # Validação de datas
+            ci_str = checkin_var.get().strip()
+            co_str = checkout_var.get().strip()
+            try:
+                _validate_dates(ci_str, co_str)
+            except ValueError as ex:
+                messagebox.showerror("Validação de datas", str(ex))
+                return
+
+            q_no = quarto_var.get().strip()
+            cm = cama_var.get().strip()  # "A" ou "B"
+            target_quarto = self.quartos.get(q_no)
+            if not target_quarto:
+                messagebox.showerror("Validação", "Quarto inválido.")
+                return
+            target_cama = target_quarto.camas.get(cm)
+            if not target_cama:
+                messagebox.showerror("Validação", "Cama inválida.")
+                return
+            if target_cama.interdited:
+                messagebox.showerror("Restrição", f"Quarto {q_no} • Cama {cm} está INTERDITADA.")
+                return
+
+            # Se for nova reserva e Cama já está reservada, bloqueia
+            if mode == "new" and target_cama.reserved:
+                messagebox.showerror("Restrição", f"Quarto {q_no} • Cama {cm} já está RESERVADA.")
+                return
+
+            # Se for edição e mudou de Quarto/Cama:
+            if mode == "edit" and (target_quarto.number != quarto.number or target_cama.idx != cama.idx):
+                if target_cama.reserved:
+                    messagebox.showerror("Restrição", f"Quarto {q_no} • Cama {cm} já está RESERVADA.")
+                    return
+                # libera a antiga
+                cama.status = "DISPONÍVEL"
+                cama.note = ""
+                cama.reservation = None
+
+            # grava na Cama alvo (inclui controle obs_blink e datas)
+            obs_text = obs_var.get().strip()
+            target_cama.reservation = {
+                "nome": nome,
+                "matricula": matricula_var.get().strip(),
+                "gerencia": gerencia_var.get().strip(),
+                "obs": obs_text,
+                "obs_blink": bool(obs_text),  # pisca apenas se houver observação
+                "check_in": ci_str,
+                "check_out": co_str,
+            }
+            target_cama.status = "RESERVADO"
+            target_cama.note = f"{target_cama.reservation['nome']} • {target_cama.reservation['gerencia']}".strip(" • ")
+
+            salvar_quartos_firebase(self.quartos)
+            self._refresh_all()
+            messagebox.showinfo("Reserva", f"Reserva {'atualizada' if mode=='edit' else 'salva'} para Quarto {q_no} • Cama {cm}.")
+            self.nb.forget(tab)
+            self.nb.select(self.tab_rooms)
+
+        def cancelar():
+            self.nb.forget(tab)
+            self.nb.select(self.tab_rooms)
+
+        ttk.Button(actions, text="Salvar Reserva", style="Primary.TButton", command=salvar).pack(side="right", padx=6)
+        ttk.Button(actions, text="Cancelar", command=cancelar).pack(side="right")
+
+    # ---------- Observação (modal por Quarto) ----------
+    def _show_obs_quarto(self, q: Quarto):
+        """Resumo das observações do Quarto: lista camas com OBS e permite parar/retomar piscar por cama."""
+        items = []
+        for c in q.camas.values():
+            text = (c.reservation or {}).get("obs", "").strip()
+            if text:
+                blink = bool((c.reservation or {}).get("obs_blink", False))
+                items.append((c, text, blink))
+
+        if not items:
+            messagebox.showinfo("Observações", f"Quarto {q.number} não possui observações.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"Observações — Quarto {q.number}")
+        win.transient(self); win.deiconify()
+        try:
+            win.attributes("-topmost", True)
+            win.after(150, lambda: win.attributes("-topmost", False))
+        except: pass
+        win.lift(); win.focus_force()
+
+        frm = ttk.Frame(win, style="Panel.TFrame")
+        frm.pack(fill="both", expand=True, padx=12, pady=12)
+
+        ttk.Label(frm, text=f"Quarto {q.number}", style="AppBar.TLabel").pack(anchor="w", pady=(0,6))
+
+        # Lista de observações
+        for c, text, blink in items:
+            box = ttk.Frame(frm, style="Panel.TFrame"); box.pack(fill="x", pady=6)
+            ttk.Label(box, text=f"Cama {c.idx}", style="Panel.TLabel").pack(side="left")
+            ttk.Label(box, text=text, style="Panel.TLabel", wraplength=420, justify="left").pack(side="left", padx=8)
+
+            btns = ttk.Frame(box, style="Panel.TFrame"); btns.pack(side="right")
+            def make_stop(_c=c):
+                def _do():
+                    if _c.reservation is None: _c.reservation = {}
+                    _c.reservation["obs_blink"] = False
+                    self._refresh_all()
+                return _do
+            def make_start(_c=c):
+                def _do():
+                    if _c.reservation is None: _c.reservation = {}
+                    if not (_c.reservation.get("obs") or "").strip():
+                        messagebox.showwarning("Observação", "Não há observação para piscar.")
+                        return
+                    _c.reservation["obs_blink"] = True
+                    self._refresh_all()
+                return _do
+            ttk.Button(btns, text="Parar piscar", command=make_stop()).pack(side="left", padx=4)
+            ttk.Button(btns, text="Retomar piscar", command=make_start()).pack(side="left", padx=4)
+
+        ttk.Button(frm, text="Fechar", command=win.destroy).pack(anchor="e", pady=(12,0))
+
+    # ---------- KPIs & Desempenho ----------
+    def _update_kpis(self):
+        quartos = list(self.quartos.values())
+
+        def camas_list():
+            for q in quartos:
+                for c in q.camas.values():
+                    yield c
+
+        camas = list(camas_list())
+        # Femininos: contar QUARTOS femininos (todos os leitos do quarto são femininos)
+        femininos_quartos = sum(
+            1 for q in quartos
+            if all(c.female_only for c in q.camas.values())
+        )
+        vals = {
+            "Disponíveis": sum(1 for c in camas if c.available),
+            "Reservados": sum(1 for c in camas if c.reserved),
+            "Interditados": sum(1 for c in camas if c.interdited),
+            "Limpeza": sum(1 for c in camas if c.cleaning),
+            "Femininos": femininos_quartos,
+        }
+        for k, v in vals.items():
+            self.kpi_labels[k].config(text=str(v))
+
+    def _refresh_desempenho(self):
+        quartos = list(self.quartos.values())
+        camas = [c for q in quartos for c in q.camas.values()]
+        total_vagas = len(camas)  # 64
+        total_quartos = len(quartos)  # 32
+        disponiveis = sum(1 for c in camas if c.available)
+        reservados = sum(1 for c in camas if c.reserved)
+        interditados= sum(1 for c in camas if c.interdited)
+        limpeza = sum(1 for c in camas if c.cleaning)
+        # Femininos: contar QUARTOS femininos
+        femininos = sum(
+            1 for q in quartos
+            if all(c.female_only for c in q.camas.values())
+        )
+
+        def setv(k, v): self.lbl_resumo[k].config(text=str(v))
+        setv("Total de Quartos", total_quartos)
+        setv("Total de Vagas", total_vagas)
+        setv("Disponíveis", disponiveis)
+        setv("Reservados", reservados)
+        setv("Interditados", interditados)
+        setv("Em Limpeza", limpeza)
+        setv("Femininos", femininos)
+
+        # Tabela de reservas
+        for r in self.table.get_children():
+            self.table.delete(r)
+        for q in quartos:
+            for c in q.camas.values():
+                if c.reservation:
+                    self.table.insert("", "end", values=(
+                        f"{q.number} • {c.idx}",
+                        c.reservation.get("nome",""),
+                        c.reservation.get("matricula",""),
+                        c.reservation.get("gerencia",""),
+                    ))
+
+# ------------------------------- Run --------------------------------
+if __name__ == "__main__":
+    app = HospedagemPro()
+    app.mainloop()
