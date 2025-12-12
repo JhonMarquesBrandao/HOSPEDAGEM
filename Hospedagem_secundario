@@ -1,0 +1,228 @@
+import tkinter as tk
+from tkinter import ttk
+import requests
+import json
+import urllib3
+
+# Desativa avisos SSL (apenas para testes)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==================== Config Visual ====================
+class Theme:
+    APP_BG = "#F3F4F8"  # fundo da aplicação
+    SURFACE = "#FFFFFF"  # cartões/painéis
+    TEXT = "#0F172A"     # texto principal
+    MUTED = "#6B7280"    # texto secundário
+    BORDER = "#E5E7EB"   # linhas suaves
+    PRIMARY = "#EF4444"  # vermelho (reservado)
+    SUCCESS = "#2563EB"  # azul (limpeza)
+    WARNING = "#F59E0B"  # laranja (interditado)
+    NEUTRAL = "#10B981"  # verde (disponível)
+    MAGENTA = "#C2185B"  # badge Feminino
+
+# ==================== Firebase ====================
+BASE_URL = "https://hospedagem-18602-default-rtdb.firebaseio.com/hospedagem"
+
+def carregar_quartos_firebase():
+    try:
+        r = requests.get(f"{BASE_URL}.json", timeout=10, verify=False)
+        r.raise_for_status()
+        data = r.json()
+        print("Dados do Firebase carregados com sucesso:", data)
+        return data
+    except Exception as e:
+        print("Erro ao carregar quartos do Firebase:", e)
+        return {}
+
+# ==================== App de Visualização Completa ====================
+class QuartosIndicadoresView(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Visualização de Quartos e Indicadores")
+        self.geometry("1200x700")
+        self.configure(bg=Theme.APP_BG)
+
+        self._build_style()
+        self._build_header()
+        self._build_kpi_cards()
+        self._build_quartos_cards()
+        self._update_indicadores()
+        self._update_quartos()
+
+        # Atualiza a cada 30 segundos
+        self.after(10000, self._update_indicadores)
+        self.after(10000, self._update_quartos)
+
+    def _build_style(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure("Main.TFrame", background=Theme.APP_BG)
+        s.configure("KPI.TFrame", background=Theme.SURFACE, relief="solid", borderwidth=1)
+        s.configure("KPI.Title.TLabel", background=Theme.SURFACE, foreground=Theme.MUTED, font=("Segoe UI", 10))
+        s.configure("KPI.Value.TLabel", background=Theme.SURFACE, foreground=Theme.TEXT, font=("Segoe UI", 18, "bold"))
+        s.configure("Card.TFrame", background=Theme.SURFACE, relief="solid", borderwidth=1)
+        s.configure("Card.Title.TLabel", background=Theme.SURFACE, foreground=Theme.TEXT, font=("Segoe UI", 10, "bold"))
+        s.configure("Card.Status.TLabel", background=Theme.SURFACE, font=("Segoe UI", 9))
+        s.configure("Card.Occupied.TLabel", background=Theme.SURFACE, foreground="#FFFFFF", font=("Segoe UI", 9, "bold"))
+
+    def _build_header(self):
+        header = ttk.Frame(self, style="Main.TFrame")
+        header.pack(fill="x", padx=16, pady=16)
+        ttk.Label(header, text="Controle de Hospedagem - Indicadores e Quartos", style="KPI.Title.TLabel").pack(anchor="w", padx=16)
+
+    def _build_kpi_cards(self):
+        kpi = ttk.Frame(self, style="Main.TFrame")
+        kpi.pack(fill="x", padx=16, pady=16)
+        self.kpi_labels = {}
+        for title in ["Disponíveis", "Reservados", "Interditados", "Limpeza", "Femininos"]:
+            card = ttk.Frame(kpi, style="KPI.TFrame")
+            card.pack(side="left", padx=8, ipadx=16, ipady=8)
+            ttk.Label(card, text=title, style="KPI.Title.TLabel").pack(anchor="w")
+            val = ttk.Label(card, text="0", style="KPI.Value.TLabel")
+            val.pack(anchor="w")
+            self.kpi_labels[title] = val
+
+    def _build_quartos_cards(self):
+        quartos = ttk.Frame(self, style="Main.TFrame")
+        quartos.pack(fill="both", expand=True, padx=16, pady=16)
+        ttk.Label(quartos, text="Quartos - Ocupados e Disponíveis", style="Card.Title.TLabel").pack(anchor="w", padx=16, pady=(0, 8))
+        self.canvas = tk.Canvas(quartos, background=Theme.APP_BG, highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(quartos, orient="vertical", command=self.canvas.yview)
+        self.grid_frame = ttk.Frame(self.canvas, style="Main.TFrame")
+        self.grid_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.create_window((0, 0), window=self.grid_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+    def _update_indicadores(self):
+        print("Atualizando indicadores...")
+        data = carregar_quartos_firebase()
+        if not data:
+            print("Nenhum dado retornado do Firebase.")
+            return
+
+        total_disponiveis = 0
+        total_reservados = 0
+        total_interditados = 0
+        total_limpeza = 0
+        total_femininos = 0
+
+        if isinstance(data, list):
+            for item in data:
+                if not item:
+                    continue
+                # Verifica se o quarto é feminino
+                feminino = False
+                for cid, cd in item.get("camas", {}).items():
+                    if cd.get("female_only", False):
+                        feminino = True
+                        break
+                if feminino:
+                    total_femininos += 1
+                # Contabiliza camas
+                for cid, cd in item.get("camas", {}).items():
+                    status = cd.get("status", "DISPONÍVEL")
+                    if status == "DISPONÍVEL":
+                        total_disponiveis += 1
+                    elif status == "RESERVADO":
+                        total_reservados += 1
+                    elif status == "INTERDITADO":
+                        total_interditados += 1
+                    elif status == "LIMPEZA":
+                        total_limpeza += 1
+        else:
+            for qnum, qd in data.items():
+                # Verifica se o quarto é feminino
+                feminino = False
+                for cid, cd in qd.get("camas", {}).items():
+                    if cd.get("female_only", False):
+                        feminino = True
+                        break
+                if feminino:
+                    total_femininos += 1
+                # Contabiliza camas
+                for cid, cd in qd.get("camas", {}).items():
+                    status = cd.get("status", "DISPONÍVEL")
+                    if status == "DISPONÍVEL":
+                        total_disponiveis += 1
+                    elif status == "RESERVADO":
+                        total_reservados += 1
+                    elif status == "INTERDITADO":
+                        total_interditados += 1
+                    elif status == "LIMPEZA":
+                        total_limpeza += 1
+
+        print(
+            f"Indicadores atualizados: Disponíveis={total_disponiveis}, Reservados={total_reservados}, Interditados={total_interditados}, Limpeza={total_limpeza}, Femininos={total_femininos}")
+        self.kpi_labels["Disponíveis"].config(text=str(total_disponiveis))
+        self.kpi_labels["Reservados"].config(text=str(total_reservados))
+        self.kpi_labels["Interditados"].config(text=str(total_interditados))
+        self.kpi_labels["Limpeza"].config(text=str(total_limpeza))
+        self.kpi_labels["Femininos"].config(text=str(total_femininos))
+
+        # Atualiza novamente após 30 segundos
+        self.after(10000, self._update_indicadores)
+
+    def _update_quartos(self):
+        print("Atualizando quartos...")
+        for widget in self.grid_frame.winfo_children():
+            widget.destroy()
+
+        data = carregar_quartos_firebase()
+        if not data:
+            print("Nenhum dado de quartos retornado do Firebase.")
+            data = {str(i): {"camas": {"A": {"status": "DISPONÍVEL"}, "B": {"status": "DISPONÍVEL"}}} for i in
+                    range(1, 33)}
+
+        cols = 6
+        row = 0
+        col = 0
+
+        for qnum in range(1, 33):
+            qnum_str = str(qnum)
+            if isinstance(data, list):
+                # Busca o quarto pela chave, não pela posição
+                qd = None
+                for item in data:
+                    if item and item.get("number") == qnum_str:
+                        qd = item
+                        break
+                if qd is None:
+                    qd = {"camas": {"A": {"status": "DISPONÍVEL"}, "B": {"status": "DISPONÍVEL"}}}
+            else:
+                qd = data.get(qnum_str, {"camas": {"A": {"status": "DISPONÍVEL"}, "B": {"status": "DISPONÍVEL"}}})
+
+            card = tk.Frame(self.grid_frame, bg=Theme.SURFACE, bd=0, highlightthickness=1,
+                            highlightbackground=Theme.BORDER)
+            card.grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
+
+            tk.Label(card, text=f"Quarto {qnum_str}", bg=Theme.SURFACE, fg=Theme.TEXT,
+                     font=("Segoe UI", 12, "bold")).pack(pady=(8, 4))
+
+            if 29 <= qnum <= 32:
+                tk.Label(card, text="Feminino", bg=Theme.MAGENTA, fg="#FFFFFF", font=("Segoe UI", 9, "bold"), padx=6,
+                         pady=2).pack()
+
+            for cid, cd in qd.get("camas", {}).items():
+                status = cd.get("status", "DISPONÍVEL")
+                status_color = Theme.NEUTRAL if status == "DISPONÍVEL" else Theme.PRIMARY if status == "RESERVADO" else Theme.WARNING if status == "INTERDITADO" else Theme.SUCCESS
+                tk.Label(card, text=f"Cama {cid}: {status}", bg=status_color, fg="#FFFFFF",
+                         font=("Segoe UI", 10, "bold")).pack(pady=(2, 2))
+
+            col += 1
+            if col >= cols:
+                col = 0
+                row += 1
+
+        for c in range(cols):
+            self.grid_frame.grid_columnconfigure(c, weight=1)
+
+        # Atualiza novamente após 30 segundos
+        self.after(10000, self._update_quartos)
+
+
+# ------------------------------- Run --------------------------------
+if __name__ == "__main__":
+    app = QuartosIndicadoresView()
+    app.mainloop()
