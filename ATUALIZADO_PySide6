@@ -1,0 +1,4371 @@
+# -*- coding: utf-8 -*-
+"""
+Sistema de Gestão de Hospedagem (PySide6) + Gestão de Usuários
+- TLS corporativo + Firebase RTDB por região
+- Ranking persistente
+- Login com aprovação (pendentes bloqueados)
+- Recuperação de senha via Outlook (Windows opcional)
+- Administração de usuários (apenas admin)
+- Exportação Excel completa com operadores e histórico
+- Mapa de reservas e KPIs
+- Botão "🚪 Sair" (retorna ao login)
+- Usuários online/offline em tempo real (5s) na aba "🛡️ Usuários Cadastrados"
+- ALERTA detalhado e visível (banner) quando ≥ limiar de quartos indisponíveis (ocupados OU bloqueados)
+- Aba de Configurações (Admin): limiar alerta, modo, intervalo auto, cooldown, som, liberar/bloquear TODOS os quartos
+- 🛠️ Melhoria profissional da aba Configurações: grupos (Alertas, KPIs, Mapa, Ações), novas opções e ações
+- 🗑️ NOVO: Botão para Cancelar Agendamento na edição de reserva
+"""
+import os, sys, time, secrets, string
+
+import q
+import urllib3, certifi, requests
+import datetime as dt
+from functools import wraps, partial
+from openpyxl import Workbook
+
+import cv2, os, hashlib
+from PySide6.QtCore import QStandardPaths, QDateTime
+from PySide6.QtWidgets import QMessageBox
+
+# ==== .env corporativo ====
+from dotenv import load_dotenv
+from pathlib import Path
+
+from PySide6.QtGui import QPageSize, QPageLayout, QTextDocument, QFont
+from PySide6.QtPrintSupport import QPrinter
+
+# --- ADICIONE ISSO JUNTO AOS OUTROS IMPORTS NO TOPO ---
+try:
+    import matplotlib
+    matplotlib.use('Qt5Agg')
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    print("AVISO: 'matplotlib' não instalado. Instale com 'pip install matplotlib'")
+
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / "firebase_config.env"
+
+print("[ENV] carregando:", ENV_FILE)
+
+try:
+    if ENV_FILE.exists():
+        load_dotenv(dotenv_path=ENV_FILE, override=True)
+        print("[ENV] ✅ arquivo carregado com sucesso")
+    else:
+        print("[ENV] ❌ ARQUIVO NÃO ENCONTRADO:", ENV_FILE)
+except Exception as e:
+    print("[ENV] ❌ Erro ao carregar .env:", e)
+
+
+def _resolve_proxies():
+    http = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    https = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+    if http or https:
+        print("[PROXY] Ativo")
+        return {
+            "http": http,
+            "https": https
+        }
+    print("[PROXY] Nenhum proxy configurado")
+    return None
+
+
+REQUESTS_PROXIES = _resolve_proxies()
+
+
+# ==== TLS corporativo ====
+def _resolve_verify():
+    if os.getenv("ALLOW_INSECURE_SSL") == "1":
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        print("[TLS] DEV: verify=False")
+        return False
+    for env_key in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CA_BUNDLE"):
+        ca_env = os.getenv(env_key)
+        if ca_env and os.path.exists(ca_env):
+            return ca_env
+    return certifi.where()
+
+
+REQUESTS_VERIFY = _resolve_verify()
+print(f"[TLS] verify={REQUESTS_VERIFY}")
+
+
+# ==== Firebase — domínio por região ====
+def _firebase_host():
+    dbname = os.getenv("FIREBASE_DBNAME", "hospedagem-18602")
+    region = (os.getenv("FIREBASE_REGION") or "").strip().lower()
+    if region and region != "us-central1":
+        return f"{dbname}.{region}.firebasedatabase.app"
+    else:
+        return f"{dbname}-default-rtdb.firebaseio.com"
+
+
+def _fb_url(path_without_json: str):
+    base = f"{path_without_json}.json"
+    token = os.getenv("FIREBASE_AUTH_TOKEN")
+    return f"{base}?auth={token}" if token else base
+
+
+# ==== BACKEND HOSPEDAGEM ====
+from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtGui import QAction, QKeySequence, QColor
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QTabWidget, QScrollArea, QFrame, QGridLayout, QMenu,
+    QDialog, QFormLayout, QLineEdit, QComboBox, QMessageBox,
+    QTableWidget, QTableWidgetItem, QTextEdit, QGraphicsDropShadowEffect,
+    QToolButton, QStyle, QHeaderView, QInputDialog, QSizePolicy, QSpinBox,
+    QCheckBox, QGroupBox
+)
+
+
+class Theme:
+    APP_BG = "#F3F4F8"
+    SURFACE = "#FFFFFF"
+    TEXT = "#0F172A"
+    MUTED = "#6B7280"
+    BORDER_SOFT = "rgba(0,0,0,0.08)"
+    PRIMARY = "#2563EB"
+    PRIMARY_HOVER = "#1E40AF"
+    ACCENT = "#EF4444"
+    SUCCESS = "#22C55E"
+    WARNING = "#F59E0B"
+    NEUTRAL = "#10B981"
+    MAGENTA = "#C2185B"
+    DANGER = "#DC2626"
+    SCHEDULED = "#3B82F6"
+    ALERT_BG = "#7C2D12"
+    ALERT_BG_ALT = "#B45309"
+
+
+STATUS = ["DISPONÍVEL", "RESERVADO", "INTERDITADO", "LIMPEZA", "AGENDADO"]
+KIT_PRICE = 65.00
+
+
+def add_soft_shadow(widget: QFrame, blur=20, y_offset=3, alpha=50):
+    shadow = QGraphicsDropShadowEffect()
+    shadow.setBlurRadius(blur)
+    shadow.setOffset(0, y_offset)
+    shadow.setColor(QColor(0, 0, 0, alpha))
+    widget.setGraphicsEffect(shadow)
+
+
+class Cama:
+    def __init__(self, idx, status="DISPONÍVEL", female_only=False, note="", contato=""):
+        self.idx = idx
+        self.status = status
+        self.female_only = bool(female_only)
+        self.note = note
+        self.contato = contato
+        self.reservations = []
+        self.reservation = None
+        self.interditado_motivo = ""
+        self.last_modified_at = None
+        self.released_at = None
+        self.last_stay_duration_hours = None
+        # operadores/ações
+        self.last_action_by = None
+        self.last_action_at = None
+        self.last_action = None
+        self.operador_bloqueio = None
+        self.operador_liberacao = None
+
+    @property
+    def available(self):
+        return self.status == "DISPONÍVEL"
+
+    @property
+    def reserved(self):
+        return self.status == "RESERVADO"
+
+    @property
+    def interdited(self):
+        return self.status == "INTERDITADO"
+
+    @property
+    def cleaning(self):
+        return self.status == "LIMPEZA"
+
+    @property
+    def scheduled(self):
+        return self.status == "AGENDADO"
+
+    def get_active_reservation(self, on_date=None):
+        d = on_date or dt.date.today()
+        for i, res in enumerate(self.reservations):
+            try:
+                ci = dt.datetime.strptime(res.get("check_in", ""), "%d/%m/%Y").date()
+                co = dt.datetime.strptime(res.get("check_out", ""), "%d/%m/%Y").date()
+                if ci <= d <= co:
+                    return i, res
+            except:
+                pass
+        return None, None
+
+    def get_next_reservation(self, after_date=None):
+        d = after_date or dt.date.today()
+        future = []
+        for i, res in enumerate(self.reservations):
+            try:
+                ci = dt.datetime.strptime(res.get("check_in", ""), "%d/%m/%Y").date()
+                if ci > d:
+                    future.append((ci, i, res))
+            except:
+                pass
+        if not future:
+            return None, None
+        future.sort(key=lambda tup: tup[0])
+        _, i, res = future[0]
+        return i, res
+
+    def find_overlap(self, ci_date, co_date, exclude_idx=None):
+        for idx, res in enumerate(self.reservations):
+            if exclude_idx is not None and idx == exclude_idx:
+                continue
+            try:
+                ex_ci = dt.datetime.strptime(res.get("check_in", ""), "%d/%m/%Y").date()
+                ex_co = dt.datetime.strptime(res.get("check_out", ""), "%d/%m/%Y").date()
+                if (ci_date <= ex_co) and (ex_ci <= co_date):
+                    return idx
+            except:
+                pass
+        return None
+
+    def add_reservation(self, res_dict):
+        self.reservations.append(res_dict)
+
+        def _key(r):
+            try:
+                return dt.datetime.strptime(r.get("check_in", ""), "%d/%m/%Y").date()
+            except:
+                return dt.date(2100, 1, 1)
+
+        self.reservations.sort(key=_key)
+
+    def remove_reservation(self, idx):
+        if idx is None or idx < 0 or idx >= len(self.reservations):
+            return None
+        try:
+            return self.reservations.pop(idx)
+        except:
+            return None
+
+
+class Quarto:
+    def __init__(self, number, female_only=False):
+        self.number = str(number)
+        self.camas = {"A": Cama("A", female_only=female_only),
+                      "B": Cama("B", female_only=female_only)}
+
+
+def seed_quartos(fem_set=None):
+    if fem_set is None:
+        fem_set = {29, 30, 31, 32}
+    quartos = {}
+    for no in range(1, 33):
+        q = Quarto(no, female_only=(no in fem_set))
+        quartos[str(no)] = q
+    preset = {1: "RESERVADO", 2: "INTERDITADO", 3: "LIMPEZA"}
+    for no, st in preset.items():
+        if str(no) in quartos:
+            quartos[str(no)].camas["A"].status = st
+    return quartos
+
+
+# ---- Firebase URLs ----
+def _firebase_urls():
+    host = _firebase_host()
+    base = f"https://{host}/hospedagem"
+    hist = f"https://{host}/historico"
+    print(f"[Firebase] host={host}")
+    return base, hist
+
+
+BASE_URL, HIST_URL = _firebase_urls()
+# ---- Firebase Config ----
+CONFIG_BASE = f"https://{_firebase_host()}/config"
+
+
+def _config_url():
+    return _fb_url(CONFIG_BASE)
+
+
+def default_config():
+    return {
+        "alert_threshold_percent": 80,  # limiar em %
+        "alert_mode": "rooms_union",  # rooms_union | rooms_occupied | rooms_blocked | beds
+        "alert_cooldown_sec": 600,  # cooldown alerta (segundos)
+        "auto_refresh_ms": 30000,  # atualização automática
+        "alert_sound": True,  # beep no alerta
+        "alert_banner": True,  # mostrar banner detalhado
+        # Novos ajustes (KPIs & Mapa):
+        "blocked_room_policy": "any_bed",  # any_bed | both_beds
+        "kpi_count_free_excludes_blocked": False,  # não contar vagas livres em quarto bloqueado
+        "map_days": 7,  # dias exibidos no mapa
+        "show_map_names_limit": 2,  # limite de nomes por célula no mapa
+    }
+
+
+def carregar_config():
+    try:
+        url = _config_url()
+        resp = requests.get(url, timeout=10, verify=REQUESTS_VERIFY)
+        resp.raise_for_status()
+        cfg = resp.json() or {}
+        base = default_config()
+        base.update({k: cfg.get(k, base[k]) for k in base.keys()})
+        return base
+    except Exception as e:
+        print(f"[Config] erro ao carregar: {e}")
+        return default_config()
+
+
+def salvar_config(cfg: dict):
+    try:
+        url = _config_url()
+        resp = requests.put(url, json=cfg, timeout=10, verify=REQUESTS_VERIFY)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[Config] erro ao salvar: {e}")
+        return False
+
+
+def quartos_to_dict(quartos):
+    data = {}
+    for qnum, q in quartos.items():
+        data[qnum] = {"number": q.number, "camas": {}}
+        for cid, c in q.camas.items():
+            data[qnum]["camas"][cid] = {
+                "idx": c.idx, "status": c.status, "female_only": c.female_only,
+                "note": c.note, "contato": c.contato,
+                "reservations": c.reservations,
+                "reservation": c.reservation,
+                "interditado_motivo": c.interditado_motivo,
+                "last_modified_at": c.last_modified_at,
+                "released_at": c.released_at,
+                "last_stay_duration_hours": c.last_stay_duration_hours,
+                "last_action_by": c.last_action_by,
+                "last_action_at": c.last_action_at,
+                "last_action": c.last_action,
+                "operador_bloqueio": c.operador_bloqueio,
+                "operador_liberacao": c.operador_liberacao,
+            }
+    return data
+
+
+def dict_to_quartos(data):
+    quartos = {}
+    if not data: return quartos
+
+    def _load_cama(c, cd):
+        c.status = cd.get("status", "DISPONÍVEL")
+        c.female_only = cd.get("female_only", False)
+        c.note = cd.get("note", "")
+        c.contato = cd.get("contato", "")
+        c.reservations = cd.get("reservations", []) or []
+        legacy = cd.get("reservation", None)
+        if legacy and not c.reservations:
+            c.reservations = [legacy]
+        c.reservation = legacy if legacy else None
+        c.interditado_motivo = cd.get("interditado_motivo", "")
+        c.last_modified_at = cd.get("last_modified_at", None)
+        c.released_at = cd.get("released_at", None)
+        c.last_stay_duration_hours = cd.get("last_stay_duration_hours", None)
+        c.last_action_by = cd.get("last_action_by", None)
+        c.last_action_at = cd.get("last_action_at", None)
+        c.last_action = cd.get("last_action", None)
+        c.operador_bloqueio = cd.get("operador_bloqueio", None)
+        c.operador_liberacao = cd.get("operador_liberacao", None)
+
+    if isinstance(data, list):
+        for qd in data:
+            if qd and "number" in qd:
+                qnum = str(qd["number"]);
+                q = Quarto(qnum)
+                for cid, cd in qd.get("camas", {}).items():
+                    _load_cama(q.camas[cid], cd)
+                quartos[qnum] = q
+    else:
+        for qnum, qd in data.items():
+            q = Quarto(qnum)
+            for cid, cd in qd.get("camas", {}).items():
+                _load_cama(q.camas[cid], cd)
+            quartos[str(qnum)] = q
+    return quartos
+
+
+def firebase_retry(max_retries=3, fallback=None):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        print(f"Falha após {max_retries} tentativas: {e}")
+                        return fallback() if callable(fallback) else fallback
+                time.sleep(2 ** attempt)
+            return None
+
+        return wrapper
+
+    return decorator
+
+
+@firebase_retry(fallback=seed_quartos)
+def carregar_quartos_firebase():
+    url = _fb_url(BASE_URL)
+    r = requests.get(url, timeout=15, verify=REQUESTS_VERIFY)
+    if r.status_code != 200:
+        print(f"[Firebase] GET {url} failed: {r.status_code} {r.text[:300]}")
+        r.raise_for_status()
+    data = r.json()
+    quartos = dict_to_quartos(data)
+    if not quartos:
+        quartos = seed_quartos({29, 30, 31, 32})
+        try:
+            salvar_quartos_firebase(quartos)
+        except Exception as e:
+            print("Warn: seed não salvo:", e)
+    return quartos
+
+
+@firebase_retry(fallback=lambda: None)
+def salvar_quartos_firebase(quartos):
+    url = _fb_url(BASE_URL)
+    data = quartos_to_dict(quartos)
+    r = requests.put(url, json=data, timeout=15, verify=REQUESTS_VERIFY)
+    if r.status_code not in (200, 204):
+        print(f"[Firebase] PUT {url} failed: {r.status_code} {r.text[:300]}")
+        r.raise_for_status()
+    print("✅ Salvo com sucesso!")
+
+
+@firebase_retry(fallback=list)
+def carregar_historico_firebase():
+    url = _fb_url(HIST_URL)
+    r = requests.get(url, timeout=15, verify=REQUESTS_VERIFY)
+    if r.status_code != 200:
+        print(f"[Firebase] GET {url} failed: {r.status_code} {r.text[:300]}")
+        r.raise_for_status()
+    data = r.json()
+    if not data:
+        return []
+    if isinstance(data, dict):
+        return list(data.values())
+    return data
+
+
+@firebase_retry(fallback=lambda: None)
+def append_historico(entry: dict):
+    url = _fb_url(HIST_URL)
+    r = requests.post(url, json=entry, timeout=15, verify=REQUESTS_VERIFY)
+    if r.status_code not in (200, 201):
+        print(f"[Firebase] POST {url} failed: {r.status_code} {r.text[:300]}")
+        r.raise_for_status()
+    return r.json()
+
+
+def _firebase_connectivity_check():
+    try:
+        url = _fb_url(HIST_URL)
+        print(f"[Firebase] Connectivity check GET {url}")
+        r = requests.get(url, timeout=10, verify=REQUESTS_VERIFY)
+        print(f"[Firebase] status={r.status_code}, body={r.text[:300]}")
+        return True
+    except requests.exceptions.SSLError as e:
+        print(f"[Firebase] SSL error: {e}")
+        return False
+    except Exception as e:
+        print(f"[Firebase] error: {e}")
+        return False
+
+
+# ==== Ranking persistente ====
+def _ranking_url_base():
+    return f"https://{_firebase_host()}/ranking"
+
+
+def _fb_url_ranking(path_without_json: str):
+    base = f"{path_without_json}.json"
+    token = os.getenv("FIREBASE_AUTH_TOKEN")
+    return f"{base}?auth={token}" if token else base
+
+
+@firebase_retry(fallback=dict)
+def carregar_ranking():
+    url = _fb_url_ranking(_ranking_url_base())
+    r = requests.get(url, timeout=10, verify=REQUESTS_VERIFY)
+    if r.status_code != 200:
+        print(f"[Firebase] GET RANKING {url} failed: {r.status_code} {r.text[:200]}")
+        r.raise_for_status()
+    data = r.json() or {}
+    return data if isinstance(data, dict) else {}
+
+
+@firebase_retry(fallback=lambda: None)
+def salvar_ranking(ranking_dict):
+    url = _fb_url_ranking(_ranking_url_base())
+    r = requests.put(url, json=ranking_dict, timeout=10, verify=REQUESTS_VERIFY)
+    if r.status_code not in (200, 204):
+        print(f"[Firebase] PUT RANKING {url} failed: {r.status_code} {r.text[:200]}")
+        r.raise_for_status()
+    return True
+
+
+@firebase_retry(fallback=lambda: None)
+def incrementa_ranking(nome: str, gerencia: str):
+    nome = (nome or "").strip()
+    gerencia = (gerencia or "").strip()
+    if not nome or not gerencia:
+        return None
+    current = carregar_ranking()
+    branch = current.get(gerencia, {})
+    branch[nome] = int(branch.get(nome, 0)) + 1
+    current[gerencia] = branch
+    salvar_ranking(current)
+    return branch[nome]
+
+
+def top10_from_ranking(ranking_dict):
+    pairs = []
+    for ger, names in (ranking_dict or {}).items():
+        if isinstance(names, dict):
+            for nome, cnt in names.items():
+                try:
+                    c = int(cnt)
+                except:
+                    c = 0
+                pairs.append((nome, ger, c))
+    pairs.sort(key=lambda tup: tup[2], reverse=True)
+    return pairs[:10]
+
+
+def total_geral_ranking(ranking_dict):
+    total = 0
+    for _ger, names in (ranking_dict or {}).items():
+        if isinstance(names, dict):
+            for _n, _c in names.items():
+                try:
+                    total += int(_c)
+                except:
+                    pass
+    return total
+
+
+# ==== Relatórios (cálculos secundários) ====
+class Relatorios:
+    def __init__(self, quartos, historico=None):
+        self.quartos = quartos
+        self.historico = historico or []
+
+    def relatorio_quartos_ocupados_diario(self):
+        ocupados = sum(1 for q in self.quartos.values() if any(c.reserved for c in q.camas.values()))
+        total = len(self.quartos)
+        return f"Quartos ocupados: {ocupados}/{total}"
+
+    def relatorio_leitos_diario(self):
+        camas = [c for q in self.quartos.values() for c in q.camas.values()]
+        ocupados = sum(1 for c in camas if c.reserved)
+        desocupados = len(camas) - ocupados
+        return f"Leitos ocupados: {ocupados}/{len(camas)} \n Desocupados: {desocupados}"
+
+    def mapa_reservas_proximos_5_dias(self):
+        hoje = dt.date.today()
+        proximos_5 = [hoje + dt.timedelta(days=i) for i in range(5)]
+        mapa = {d.strftime("%d/%m"): [] for d in proximos_5}
+        for q in self.quartos.values():
+            for c in q.camas.values():
+                for r in c.reservations:
+                    try:
+                        ci = dt.datetime.strptime(r.get("check_in"), "%d/%m/%Y").date()
+                        co = dt.datetime.strptime(r.get("check_out", ""), "%d/%m/%Y").date()
+                        for d in proximos_5:
+                            if ci <= d <= co:
+                                mapa[d.strftime("%d/%m")].append(f"Quarto {q.number} • Cama {c.idx}")
+                    except:
+                        pass
+        return mapa
+
+
+
+# ==== UI Principal ====
+class HospedagemProQt(QMainWindow):
+    AUTO_RELEASE_AFTER_CHECKOUT = False
+
+    def _kpis_para_email(self):
+        """Calcula KPIs com base em self.quartos e self.config."""
+
+        def _is_room_blocked(q):
+            policy = (self.config.get("blocked_room_policy", "any_bed") or "any_bed").strip().lower()
+            beds = list(q.camas.values())
+            if policy == "both_beds":
+                return all(getattr(c, "status", "") == "INTERDITADO" for c in beds)
+            return any(getattr(c, "status", "") == "INTERDITADO" for c in beds)
+
+        quartos = list(self.quartos.values())
+        camas = [c for q in quartos for c in q.camas.values()]
+        total_vagas = len(camas)
+        vagas_ocupadas = sum(1 for c in camas if c.status == "OCUPADO")
+        total_quartos = len(quartos)
+        quartos_ocupados = sum(1 for q in quartos if any(c.status == "RESERVADO" for c in q.camas.values()))
+        quartos_agendados = sum(1 for q in quartos if any(c.status == "AGENDADO" for c in q.camas.values()))
+        quartos_bloqueados = sum(1 for q in quartos if _is_room_blocked(q))
+
+        excludes_blocked = bool(self.config.get("kpi_count_free_excludes_blocked", False))
+        blocked_numbers = {q.number for q in quartos if _is_room_blocked(q)}
+        vagas_livres = 0
+        for q in quartos:
+            for c in q.camas.values():
+                if c.status == "DISPONÍVEL" and (not excludes_blocked or q.number not in blocked_numbers):
+                    vagas_livres += 1
+
+        indisponiveis_quartos = 0
+        for q in quartos:
+            tem_ocupado = any(c.status == "RESERVADO" for c in q.camas.values())
+            tem_bloq = _is_room_blocked(q)
+            if tem_ocupado or tem_bloq:
+                indisponiveis_quartos += 1
+        perc_ind = (indisponiveis_quartos / total_quartos * 100.0) if total_quartos else 0.0
+
+        return {
+            "total_quartos": total_quartos,
+            "total_vagas": total_vagas,
+            "vagas_ocupadas": vagas_ocupadas,
+            "vagas_livres": vagas_livres,
+            "quartos_ocupados": quartos_ocupados,
+            "quartos_agendados": quartos_agendados,
+            "quartos_bloqueados": quartos_bloqueados,
+            "indisponiveis_quartos": indisponiveis_quartos,
+            "perc_indisponiveis_quartos": round(perc_ind, 1),
+        }
+
+    def validar_codigo_reserva(self, q: Quarto, c: Cama, res_idx: int):
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        import datetime as dt
+
+        # Verifica se há reservas
+        if not c.reservations:
+            return
+
+        # Pega a reserva (normalmente a primeira ou a que foi clicada)
+        r = c.reservations[res_idx] if res_idx < len(c.reservations) else c.reservations[0]
+
+        # Se já estiver confirmado, avisa e para
+        if r.get("status_confirmacao") == "CONFIRMADO":
+            QMessageBox.information(self, "Já confirmado", "Esta reserva já foi validada e confirmada.")
+            return
+
+        # Pede o código ao operador
+        codigo_digitado, ok = QInputDialog.getText(
+            self,
+            "Check-in (Validação)",
+            f"Reserva de: {r.get('nome', 'Hóspede')}\n\nDigite o código de confirmação recebido por e-mail:"
+        )
+
+        if not ok:
+            return
+
+        # Compara removendo espaços em branco
+        codigo_real = str(r.get("codigo_confirmacao", "")).strip()
+        digitado = str(codigo_digitado).strip()
+
+        if digitado != codigo_real:
+            QMessageBox.warning(self, "Erro", "❌ Código incorreto! O check-in não foi realizado.")
+            return
+
+        # --- SUCESSO ---
+        r["status_confirmacao"] = "CONFIRMADO"
+        r["codigo_validado_em"] = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+
+        # Atualiza visualmente para VERMELHO
+        c.status = "OCUPADO"
+        c.last_action = "CHECK-IN CONFIRMADO"
+        c.last_action_at = r["codigo_validado_em"]
+        c.last_action_by = self.usuario_ativo
+
+        # Salva no Firebase e atualiza a tela
+        salvar_quartos_firebase(self.quartos)
+        self.refresh_all()
+
+        QMessageBox.information(self, "Sucesso", "✅ Código validado com sucesso!\nStatus alterado para RESERVADO.")
+
+    def force_refresh_data(self):
+        """Força o download dos dados do Firebase e atualiza todas as telas."""
+        try:
+            # Muda o texto do cursor/botão para dar feedback
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+
+            # 1. Baixa tudo do Firebase novamente
+            self.quartos = carregar_quartos_firebase()
+            self.historico = carregar_historico_firebase()
+            self.ranking = carregar_ranking()
+
+            # 2. Atualiza a tela
+            self.refresh_all()
+
+            QApplication.restoreOverrideCursor()
+            QMessageBox.information(self, "Sincronização", "✅ Dados atualizados com o servidor!")
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            print(f"Erro ao atualizar: {e}")
+            QMessageBox.warning(self, "Erro", "Falha ao baixar dados do servidor.")
+
+    def _cancellations_para_email(self):
+        """Coleta cancelamentos do histórico e, se necessário, fallback pela auditoria da cama."""
+        rows = []
+        for e in (self.historico or []):
+            if not isinstance(e, dict):
+                continue
+            if (e.get("tipo") or "").upper() == "CANCELAMENTO":
+                rows.append({
+                    "quarto": e.get("quarto", ""),
+                    "cama": e.get("cama", ""),
+                    "nome": e.get("nome", ""),
+                    "gerencia": e.get("gerencia", ""),
+                    "matricula": e.get("matricula", ""),
+                    "periodo": f"{e.get('check_in', '')} → {e.get('check_out', '')}",
+                    "quem_cancelou": e.get("operador_cancelamento", "") or e.get("last_action_by", ""),
+                    "quando": e.get("cancelado_em", "") or e.get("last_action_at", ""),
+                    "motivo": e.get("cancel_reason", "") or "—",
+                    "observacao": e.get("obs", "") or "",
+                })
+        if rows:
+            return rows
+
+        # Fallback: procurar nas camas onde a última ação foi cancelamento
+        for q in self.quartos.values():
+            for c in q.camas.values():
+                if (getattr(c, "last_action", "") or "").upper() == "CANCELAMENTO":
+                    rows.append({
+                        "quarto": q.number, "cama": c.idx,
+                        "nome": "", "gerencia": "", "matricula": "", "periodo": "",
+                        "quem_cancelou": getattr(c, "last_action_by", "") or "",
+                        "quando": getattr(c, "last_action_at", "") or "",
+                        "motivo": (getattr(c, "interditado_motivo", "") or "—"),
+                        "observacao": "",
+                    })
+        return rows
+
+    def _build_html_admin_email(self, kpi, cancel_rows):
+        import datetime as _dt
+        now = _dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+        th = self.config.get("alert_threshold_percent", 80)
+
+        canc_html = "<p>Reservas Canceladas: <strong>nenhuma</strong></p>"
+        if cancel_rows:
+            lines = []
+            for r in cancel_rows:
+                base = (f"Quarto {r['quarto']} • Cama {r['cama']} — "
+                        f"Nome: {r['nome'] or '—'} • Gerência: {r['gerencia'] or '—'} • Matrícula: {r['matricula'] or '—'}")
+                periodo = f" • Período: {r['periodo']}" if r["periodo"] else ""
+                auditoria = f" • Quem cancelou: {r['quem_cancelou'] or '—'} • Quando: {r['quando'] or '—'}"
+                motivo = f" • Motivo: {r['motivo'] or '—'}"
+                obs = f" • Obs: {r['observacao']}" if r["observacao"] else ""
+                lines.append(f"• {base}{periodo}{auditoria}{motivo}{obs}")
+            canc_html = "<h3>Reservas Canceladas</h3><p>" + "<br>".join(lines) + "</p>"
+
+        html = f"""
+        <div style="font-family:Segoe UI, Arial, sans-serif; color:#0F172A;">
+          <h2>Relatório de Ocupação — {now}</h2>
+          <h3>Resumo (Quartos / Camas)</h3>
+          <p>Total de quartos: <code>{kpi['total_quartos']}</code></p>
+          <p>Total de vagas (camas): <code>{kpi['total_vagas']}</code></p>
+          <p>Quartos ocupados: <code>{kpi['quartos_ocupados']}</code></p>
+          <p>Quartos bloqueados: <code>{kpi['quartos_bloqueados']}</code></p>
+          <p>Quartos agendados: <code>{kpi['quartos_agendados']}</code></p>
+          <p>Vagas ocupadas: <code>{kpi['vagas_ocupadas']}</code> • Vagas livres: <code>{kpi['vagas_livres']}</code></p>
+          <p><strong>Indisponíveis (ocupados + bloqueados):</strong> <code>{kpi['indisponiveis_quartos']}/{kpi['total_quartos']}</code>
+             (<strong>{kpi['perc_indisponiveis_quartos']}%</strong>)</p>
+          <p>Percentual configurado (limiar de alerta): <code>{th:.0f}%</code></p>
+          {canc_html}
+          <hr style="border:none;border-top:1px solid #e5e7eb;margin:16px 0;" />
+          <p style="color:#6B7280;">Este e-mail foi enviado automaticamente para todos os administradores cadastrados.</p>
+        </div>
+        """
+        return html
+
+    def enviar_relatorio_admins(self):
+        """
+        Gera os KPIs e cancelamentos e envia UM e-mail para todos os administradores cadastrados.
+        Conteúdo: Ocupados, Livres, Agendados, Bloqueados, Percentual atingido,
+                  Reservas canceladas (quem cancelou e por quê).
+        """
+
+        # --- KPIs (usa o mesmo raciocínio do seu código) ---
+        def _is_room_blocked(q):
+            policy = (self.config.get("blocked_room_policy", "any_bed") or "any_bed").strip().lower()
+            beds = list(q.camas.values())
+            if policy == "both_beds":
+                return all(getattr(c, "status", "") == "INTERDITADO" for c in beds)
+            return any(getattr(c, "status", "") == "INTERDITADO" for c in beds)
+
+        quartos = list(self.quartos.values())
+        camas = [c for q in quartos for c in q.camas.values()]
+
+        total_vagas = len(camas)
+        vagas_ocupadas = sum(1 for c in camas if c.status == "OCUPADO")
+
+        total_quartos = len(quartos)
+        quartos_ocupados = sum(1 for q in quartos if any(c.status == "RESERVADO" for c in q.camas.values()))
+        quartos_agendados = sum(1 for q in quartos if any(c.status == "AGENDADO" for c in q.camas.values()))
+        quartos_bloqueados = sum(1 for q in quartos if _is_room_blocked(q))
+
+        excludes_blocked = bool(self.config.get("kpi_count_free_excludes_blocked", False))
+        blocked_numbers = {q.number for q in quartos if _is_room_blocked(q)}
+        vagas_livres = 0
+        for q in quartos:
+            for c in q.camas.values():
+                if c.status == "DISPONÍVEL" and (not excludes_blocked or q.number not in blocked_numbers):
+                    vagas_livres += 1
+
+        indisponiveis_quartos = 0
+        for q in quartos:
+            tem_ocupado = any(c.status == "RESERVADO" for c in q.camas.values())
+            tem_bloq = _is_room_blocked(q)
+            if tem_ocupado or tem_bloq:
+                indisponiveis_quartos += 1
+        perc_ind = (indisponiveis_quartos / total_quartos * 100.0) if total_quartos else 0.0
+
+        kpi = {
+            "total_quartos": total_quartos,
+            "total_vagas": total_vagas,
+            "vagas_ocupadas": vagas_ocupadas,
+            "vagas_livres": vagas_livres,
+            "quartos_ocupados": quartos_ocupados,
+            "quartos_agendados": quartos_agendados,
+            "quartos_bloqueados": quartos_bloqueados,
+            "indisponiveis_quartos": indisponiveis_quartos,
+            "perc_indisponiveis_quartos": round(perc_ind, 1),
+        }
+
+        # --- Cancelamentos (do histórico e fallback auditoria da cama) ---
+        canc_rows = []
+        for e in (self.historico or []):
+            if not isinstance(e, dict):
+                continue
+            if (e.get("tipo") or "").upper() == "CANCELAMENTO":
+                canc_rows.append({
+                    "quarto": e.get("quarto", ""),
+                    "cama": e.get("cama", ""),
+                    "nome": e.get("nome", ""),
+                    "gerencia": e.get("gerencia", ""),
+                    "matricula": e.get("matricula", ""),
+                    "periodo": f"{e.get('check_in', '')} → {e.get('check_out', '')}",
+                    "quem_cancelou": e.get("operador_cancelamento", "") or e.get("last_action_by", ""),
+                    "quando": e.get("cancelado_em", "") or e.get("last_action_at", ""),
+                    "motivo": e.get("cancel_reason", "") or "—",
+                    "observacao": e.get("obs", "") or "",
+                })
+        if not canc_rows:
+            for q in self.quartos.values():
+                for c in q.camas.values():
+                    if (getattr(c, "last_action", "") or "").upper() == "CANCELAMENTO":
+                        canc_rows.append({
+                            "quarto": q.number, "cama": c.idx,
+                            "nome": "", "gerencia": "", "matricula": "", "periodo": "",
+                            "quem_cancelou": getattr(c, "last_action_by", "") or "",
+                            "quando": getattr(c, "last_action_at", "") or "",
+                            "motivo": (getattr(c, "interditado_motivo", "") or "—"),
+                            "observacao": "",
+                        })
+
+        # --- Monta HTML ---
+        import datetime as _dt
+        now = _dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+        th = self.config.get("alert_threshold_percent", 80)
+
+        canc_html = "<p>Reservas Canceladas: <strong>nenhuma</strong></p>"
+        if canc_rows:
+            lines = []
+            for r in canc_rows:
+                base = (f"Quarto {r['quarto']} • Cama {r['cama']} — "
+                        f"Nome: {r['nome'] or '—'} • Gerência: {r['gerencia'] or '—'} • Matrícula: {r['matricula'] or '—'}")
+                periodo = f" • Período: {r['periodo']}" if r["periodo"] else ""
+                auditoria = f" • Quem cancelou: {r['quem_cancelou'] or '—'} • Quando: {r['quando'] or '—'}"
+                motivo = f" • Motivo: {r['motivo'] or '—'}"
+                obs = f" • Obs: {r['observacao']}" if r["observacao"] else ""
+                lines.append(f"• {base}{periodo}{auditoria}{motivo}{obs}")
+            canc_html = "<h3>Reservas Canceladas</h3><p>" + "<br>".join(lines) + "</p>"
+
+        html = f"""
+        <div style="font-family:Segoe UI, Arial, sans-serif; color:#0F172A;">
+          <h2>Relatório de Ocupação — {now}</h2>
+
+          <h3>Resumo (Quartos / Camas)</h3>
+          <p>Total de quartos: <code>{kpi['total_quartos']}</code></p>
+          <p>Total de vagas (camas): <code>{kpi['total_vagas']}</code></p>
+          <p>Quartos ocupados: <code>{kpi['quartos_ocupados']}</code></p>
+          <p>Quartos bloqueados: <code>{kpi['quartos_bloqueados']}</code></p>
+          <p>Quartos agendados: <code>{kpi['quartos_agendados']}</code></p>
+          <p>Vagas ocupadas: <code>{kpi['vagas_ocupadas']}</code> • Vagas livres: <code>{kpi['vagas_livres']}</code></p>
+          <p><strong>Indisponíveis (ocupados + bloqueados):</strong> <code>{kpi['indisponiveis_quartos']}/{kpi['total_quartos']}</code>
+             (<strong>{kpi['perc_indisponiveis_quartos']}%</strong>)</p>
+          <p>Percentual configurado (limiar de alerta): <code>{th:.0f}%</code></p>
+
+          {canc_html}
+
+          <hr style="border:none;border-top:1px solid #e5e7eb;margin:16px 0;" />
+          <p style="color:#6B7280;">Este e-mail foi enviado automaticamente para todos os administradores cadastrados.</p>
+        </div>
+        """
+
+        # --- Envio (UMA vez para TODOS os admins cadastrados) ---
+        assunto = f"Relatório diário: {kpi['perc_indisponiveis_quartos']}% indisponíveis (ocupados+bloqueados)"
+        try:
+            notificar_admins(assunto, html)
+        except Exception as e:
+            print('[AdminEmail] erro ao notificar:', e)
+
+    def __init__(self, usuario_ativo=None, privilegio_usuario="usuario"):
+        super().__init__()
+        self.usuario_ativo = usuario_ativo
+        self.privilegio_usuario = privilegio_usuario
+        self.is_admin = (self.privilegio_usuario or "").strip().lower() == "admin"
+        self.setWindowTitle("• Gestão de Hospedagem (PySide6)")
+        self.resize(1400, 900)
+        self.setStyleSheet(f"""
+        QWidget {{ outline: none; }}
+        QFrame {{ background: transparent; }}
+        QLabel {{ color: {Theme.TEXT}; }}
+        QLineEdit, QComboBox {{
+            border: 1px solid {Theme.BORDER_SOFT};
+            background: #F9FAFB;
+            padding: 8px 10px;
+            border-radius: 10px;
+        }}
+        QLineEdit:focus, QComboBox:focus {{
+            border: 1px solid rgba(37,99,235,0.35);
+            background: #FFFFFF;
+        }}
+        QPushButton {{
+            border: 1px solid {Theme.BORDER_SOFT};
+            background: {Theme.PRIMARY};
+            color: white;
+            padding: 8px 14px;
+            border-radius: 10px;
+            font-weight: 600;
+        }}
+        QPushButton:hover {{ background: {Theme.PRIMARY_HOVER}; }}
+        QTableWidget {{
+            border: 1px solid {Theme.BORDER_SOFT};
+            background: {Theme.SURFACE};
+            border-radius: 10px;
+        }}
+        QScrollArea {{ border: none; background: transparent; }}
+        """)
+        # dados
+        self.quartos = carregar_quartos_firebase()
+        self.historico = carregar_historico_firebase()
+        if not isinstance(self.quartos, dict):
+            self.quartos = seed_quartos()
+        if not isinstance(self.historico, list):
+            self.historico = []
+        self.ranking = carregar_ranking()
+        self.config = carregar_config()
+        # conectividade
+        if not _firebase_connectivity_check():
+            QMessageBox.warning(self, "Conectividade Firebase",
+                                "Não foi possível validar a conexão ao Firebase.\n"
+                                "Verifique FIREBASE_REGION, REQUESTS_CA_BUNDLE e/ou FIREBASE_AUTH_TOKEN.")
+        self.relatorios = Relatorios(self.quartos, self.historico)
+        self.filtered = None
+        self.auto_timer = QTimer(self)
+        self.auto_timer.timeout.connect(self.auto_refresh)
+        self.auto_timer.start(int(self.config.get("auto_refresh_ms", 30000)))
+        self._last_occupancy_alert = None
+        self._last_alert_stats = None
+        self._alert_email_sent = False
+        # central
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(16)
+        # appbar + banner
+        appbar = QVBoxLayout()
+        top_row = QHBoxLayout()
+        self.lbl_title = QLabel("Controle Hospedagem")
+        self.lbl_title.setStyleSheet("font-weight:800; font-size:18px;")
+        self.badge_alert = QLabel("")
+        self.badge_alert.setStyleSheet(
+            "color:white; background:#DC2626; padding:3px 8px; border-radius:8px; font-weight:700;")
+        self.badge_alert.hide()
+        btn_refresh = QPushButton("🔄 Atualizar (Sincronizar)");
+        btn_refresh.clicked.connect(self.force_refresh_data)
+        btn_excel = QPushButton("📊 Excel");
+        btn_excel.clicked.connect(self.export_excel)
+        btn_logout = QPushButton("🚪 Sair");
+        btn_logout.clicked.connect(self.logout)
+        top_row.addWidget(self.lbl_title);
+        top_row.addSpacing(8);
+        top_row.addWidget(self.badge_alert)
+        top_row.addStretch(1);
+        top_row.addWidget(btn_excel);
+        top_row.addWidget(btn_refresh);
+        top_row.addWidget(btn_logout)
+        appbar.addLayout(top_row)
+        # Banner de Alerta
+        self.alert_banner = QFrame()
+        self.alert_banner.setStyleSheet(f"background:{Theme.ALERT_BG}; border-radius:12px;")
+        add_soft_shadow(self.alert_banner, blur=28, y_offset=6, alpha=60)
+        self.alert_banner.setVisible(False)
+        banner_lay = QHBoxLayout(self.alert_banner);
+        banner_lay.setContentsMargins(12, 10, 12, 10);
+        banner_lay.setSpacing(12)
+        self.alert_icon = QLabel("⚠️");
+        self.alert_icon.setStyleSheet("font-size:22px; color:white;")
+        self.alert_text = QLabel("Alerta de ocupação");
+        self.alert_text.setStyleSheet("color:white; font-weight:800;");
+        self.alert_text.setWordWrap(True)
+        self.btn_alert_details = QPushButton("Ver detalhes")
+        self.btn_alert_details.setStyleSheet(
+            "background:#FDE68A; color:#7C2D12; font-weight:700; padding:6px 10px; border-radius:8px;")
+        self.btn_alert_details.clicked.connect(self.show_alert_details)
+        banner_lay.addWidget(self.alert_icon)
+        banner_lay.addWidget(self.alert_text, 1)
+        banner_lay.addWidget(self.btn_alert_details, 0)
+        self._banner_pulse_state = False
+        self.banner_timer = QTimer(self)
+
+        def _kpis_para_email(self):
+            """Calcula KPIs com base em self.quartos e self.config."""
+
+            def _is_room_blocked(q):
+                policy = (self.config.get("blocked_room_policy", "any_bed") or "any_bed").strip().lower()
+                beds = list(q.camas.values())
+                if policy == "both_beds":
+                    return all(getattr(c, "status", "") == "INTERDITADO" for c in beds)
+                return any(getattr(c, "status", "") == "INTERDITADO" for c in beds)
+
+            quartos = list(self.quartos.values())
+            camas = [c for q in quartos for c in q.camas.values()]
+
+            total_vagas = len(camas)
+            vagas_ocupadas = sum(1 for c in camas if c.status == "OCUPADO")
+
+            total_quartos = len(quartos)
+            quartos_ocupados = sum(1 for q in quartos if any(c.status == "RESERVADO" for c in q.camas.values()))
+            quartos_agendados = sum(1 for q in quartos if any(c.status == "AGENDADO" for c in q.camas.values()))
+            quartos_bloqueados = sum(1 for q in quartos if _is_room_blocked(q))
+
+            excludes_blocked = bool(self.config.get("kpi_count_free_excludes_blocked", False))
+            blocked_numbers = {q.number for q in quartos if _is_room_blocked(q)}
+            vagas_livres = 0
+            for q in quartos:
+                for c in q.camas.values():
+                    if c.status == "DISPONÍVEL" and (not excludes_blocked or q.number not in blocked_numbers):
+                        vagas_livres += 1
+
+            indisponiveis_quartos = 0
+            for q in quartos:
+                tem_ocupado = any(c.status == "RESERVADO" for c in q.camas.values())
+                tem_bloq = _is_room_blocked(q)
+
+                if tem_ocupado or tem_bloq:
+                    indisponiveis_quartos += 1
+
+            perc_ind = (indisponiveis_quartos / total_quartos * 100.0) if total_quartos else 0.0
+
+            return {
+                "total_quartos": total_quartos,
+                "total_vagas": total_vagas,
+                "vagas_ocupadas": vagas_ocupadas,
+                "vagas_livres": vagas_livres,
+                "quartos_ocupados": quartos_ocupados,
+                "quartos_agendados": quartos_agendados,
+                "quartos_bloqueados": quartos_bloqueados,
+                "indisponiveis_quartos": indisponiveis_quartos,
+                "perc_indisponiveis_quartos": round(perc_ind, 1),
+            }
+
+        def _cancellations_para_email(self):
+            """Coleta cancelamentos do histórico e, se necessário, fallback pela auditoria da cama."""
+            rows = []
+            for e in (self.historico or []):
+                if not isinstance(e, dict): continue
+                if (e.get("tipo") or "").upper() == "CANCELAMENTO":
+                    rows.append({
+                        "quarto": e.get("quarto", ""),
+                        "cama": e.get("cama", ""),
+                        "nome": e.get("nome", ""),
+                        "gerencia": e.get("gerencia", ""),
+                        "matricula": e.get("matricula", ""),
+                        "periodo": f"{e.get('check_in', '')} → {e.get('check_out', '')}",
+                        "quem_cancelou": e.get("operador_cancelamento", "") or e.get("last_action_by", ""),
+                        "quando": e.get("cancelado_em", "") or e.get("last_action_at", ""),
+                        "motivo": e.get("cancel_reason", "") or "—",
+                        "observacao": e.get("obs", "") or "",
+                    })
+            if not rows:
+                for q in self.quartos.values():
+                    for c in q.camas.values():
+                        if (getattr(c, "last_action", "") or "").upper() == "CANCELAMENTO":
+                            rows.append({
+                                "quarto": q.number, "cama": c.idx,
+                                "nome": "", "gerencia": "", "matricula": "", "periodo": "",
+                                "quem_cancelou": getattr(c, "last_action_by", "") or "",
+                                "quando": getattr(c, "last_action_at", "") or "",
+                                "motivo": (getattr(c, "interditado_motivo", "") or "—"),
+                                "observacao": "",
+                            })
+            return rows
+
+        def _build_html_admin_email(self, kpi, cancel_rows):
+            import datetime as _dt
+            now = _dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+            th = self.config.get("alert_threshold_percent", 80)
+
+            canc_html = "<p>Reservas Canceladas: <strong>nenhuma</strong></p>"
+            if cancel_rows:
+                lines = []
+                for r in cancel_rows:
+                    base = (f"Quarto {r['quarto']} • Cama {r['cama']} — "
+                            f"Nome: {r['nome'] or '—'} • Gerência: {r['gerencia'] or '—'} • Matrícula: {r['matricula'] or '—'}")
+                    periodo = f" • Período: {r['periodo']}" if r["periodo"] else ""
+                    auditoria = f" • Quem cancelou: {r['quem_cancelou'] or '—'} • Quando: {r['quando'] or '—'}"
+                    motivo = f" • Motivo: {r['motivo'] or '—'}"
+                    obs = f" • Obs: {r['observacao']}" if r["observacao"] else ""
+                    lines.append(f"• {base}{periodo}{auditoria}{motivo}{obs}")
+                canc_html = "<h3>Reservas Canceladas</h3><p>" + "<br>".join(lines) + "</p>"
+
+            html = f"""
+            <div style="font-family:Segoe UI, Arial, sans-serif; color:#0F172A;">
+              <h2>Relatório de Ocupação — {now}</h2>
+
+              <h3>Resumo (Quartos / Camas)</h3>
+              <p>Total de quartos: <code>{kpi['total_quartos']}</code></p>
+              <p>Total de vagas (camas): <code>{kpi['total_vagas']}</code></p>
+              <p>Quartos ocupados: <code>{kpi['quartos_ocupados']}</code></p>
+              <p>Quartos bloqueados: <code>{kpi['quartos_bloqueados']}</code></p>
+              <p>Quartos agendados: <code>{kpi['quartos_agendados']}</code></p>
+              <p>Vagas ocupadas: <code>{kpi['vagas_ocupadas']}</code> • Vagas livres: <code>{kpi['vagas_livres']}</code></p>
+              <p><strong>Indisponíveis (ocupados + bloqueados):</strong> <code>{kpi['indisponiveis_quartos']}/{kpi['total_quartos']}</code>
+                 (<strong>{kpi['perc_indisponiveis_quartos']}%</strong>)</p>
+              <p>Percentual configurado (limiar de alerta): <code>{th:.0f}%</code></p>
+
+              {canc_html}
+
+              <hr style="border:none;border-top:1px solid #e5e7eb;margin:16px 0;" />
+              <p style="color:#6B7280;">Este e-mail foi enviado automaticamente para todos os administradores cadastrados.</p>
+            </div>
+            """
+            return html
+
+        def enviar_relatorio_admins(self):
+            """Gera e envia UM e-mail para os administradores com os dados exigidos."""
+            kpi = self._kpis_para_email()
+            canc = self._cancellations_para_email()
+            html = self._build_html_admin_email(kpi, canc)
+            assunto = f"Relatório diário: {kpi['perc_indisponiveis_quartos']}% indisponíveis (ocupados+bloqueados)"
+            try:
+                notificar_admins(assunto, html)
+            except Exception as e:
+                print('[AdminEmail] erro ao notificar:', e)
+
+        def start_daily_admin_email_timer(self, hour=21, minute=0):
+            """Envia 1x/dia no horário escolhido usando QTimer."""
+            from PySide6.QtCore import QTimer
+            self._daily_email_timer = QTimer(self)
+
+            def _tick():
+                import datetime as _dt
+                now = _dt.datetime.now()
+                if now.hour == hour and now.minute == minute:
+                    mk = now.strftime('%Y-%m-%d %H:%M')
+                    if getattr(self, '_last_daily_email_at', None) != mk:
+                        self.enviar_relatorio_admins()
+                        self._last_daily_email_at = mk
+
+            self._daily_email_timer.timeout.connect(_tick)
+            self._daily_email_timer.start(30_000)
+
+        def _pulse():
+            self._banner_pulse_state = not self._banner_pulse_state
+            bg = Theme.ALERT_BG_ALT if self._banner_pulse_state else Theme.ALERT_BG
+            self.alert_banner.setStyleSheet(f"background:{bg}; border-radius:12px;")
+
+        self.banner_timer.timeout.connect(_pulse)
+        appbar.addWidget(self.alert_banner)
+        root.addLayout(appbar)
+        # tabs
+        self.tabs = QTabWidget()
+        self.tabs.setTabPosition(QTabWidget.North)
+        self.tabs.setStyleSheet(f"""
+        QTabWidget::pane {{ border: none; background: transparent; }}
+        QTabBar::tab {{
+            background: #E9EEF7;
+            color: {Theme.TEXT};
+            padding: 10px 18px;
+            margin: 0 6px;
+            border: 1px solid {Theme.BORDER_SOFT};
+            border-top-left-radius: 12px;
+            border-top-right-radius: 12px;
+        }}
+        QTabBar::tab:hover {{ background: #EDF2FA; }}
+        QTabBar::tab:selected {{
+            background: {Theme.SURFACE};
+            border-bottom-color: {Theme.SURFACE};
+            color: {Theme.TEXT};
+        }}
+        """)
+        root.addWidget(self.tabs, 1)
+        # Quartos
+        self.tab_rooms = QWidget();
+        self.tabs.addTab(self.tab_rooms, "🛏️ Quartos")
+        v_rooms = QVBoxLayout(self.tab_rooms);
+        v_rooms.setContentsMargins(8, 8, 8, 8);
+        v_rooms.setSpacing(12)
+        h_top = QHBoxLayout()
+        h_top.addWidget(QLabel("Pesquisar"))
+        self.search_entry = QLineEdit();
+        self.search_entry.setPlaceholderText("Nome, matrícula, gerência, observação…")
+        self.search_entry.textChanged.connect(self.apply_filter)
+        h_top.addWidget(self.search_entry, 1)
+        btn_limpar = QPushButton("🧹 Limpar");
+        btn_limpar.clicked.connect(self.clear_filter)
+        btn_buscar = QPushButton("🔎 Buscar");
+        btn_buscar.clicked.connect(self.apply_filter)
+        h_top.addWidget(btn_buscar);
+        h_top.addWidget(btn_limpar)
+        v_rooms.addLayout(h_top)
+        # KPI cards
+        self.kpi_labels = {}
+        h_kpis = QHBoxLayout();
+        h_kpis.setSpacing(12)
+        for title in ["Vagas Ocupadas", "Vagas Livres", "Quartos Parcialmente Ocupado", "Quartos Bloqueados",
+                      "Reservados"]:
+            card = QFrame()
+            card.setStyleSheet(
+                f"background:{Theme.SURFACE}; border: 1px solid {Theme.BORDER_SOFT}; border-radius:12px;")
+            add_soft_shadow(card, blur=22, y_offset=4, alpha=45)
+            lay = QVBoxLayout(card);
+            lay.setContentsMargins(14, 14, 14, 14);
+            lay.setSpacing(8)
+            t = QLabel(title);
+            t.setStyleSheet(f"color:{Theme.MUTED};")
+            v = QLabel("0");
+            v.setStyleSheet("font-size:26px; font-weight:800;")
+            lay.addWidget(t);
+            lay.addWidget(v)
+            h_kpis.addWidget(card)
+            self.kpi_labels[title] = v
+        v_rooms.addLayout(h_kpis)
+        # grid
+        self.scroll = QScrollArea();
+        self.scroll.setWidgetResizable(True)
+        self.grid_container = QWidget()
+        self.scroll.setWidget(self.grid_container)
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setContentsMargins(8, 8, 8, 8)
+        self.grid_layout.setHorizontalSpacing(14)
+        self.grid_layout.setVerticalSpacing(14)
+        v_rooms.addWidget(self.scroll, 1)
+        # Desempenho
+        self.tab_perf = QWidget();
+        self.tabs.addTab(self.tab_perf, "📈 Desempenho")
+        v_perf = QVBoxLayout(self.tab_perf);
+        v_perf.setContentsMargins(8, 8, 8, 8);
+        v_perf.setSpacing(12)
+        h_perf = QHBoxLayout();
+        h_perf.addWidget(QLabel("Indicadores de Desempenho"))
+        btn_up_perf = QPushButton("🔄 Atualizar (Sincronizar)");
+        btn_up_perf.clicked.connect(self.force_refresh_data)
+        h_perf.addStretch(1);
+        h_perf.addWidget(btn_up_perf)
+        v_perf.addLayout(h_perf)
+        self.lbl_resumo = {}
+        h_resume = QHBoxLayout();
+        h_resume.setSpacing(12)
+        for title in ["Total de Quartos", "Total de Vagas", "Vagas Ocupadas", "Vagas Livres",
+                      "Quartos Parcialmente Ocupado", "Quartos Bloqueados", "Reservados"]:
+            card = QFrame()
+            card.setStyleSheet(
+                f"background:{Theme.SURFACE}; border: 1px solid {Theme.BORDER_SOFT}; border-radius:12px;")
+            add_soft_shadow(card, blur=22, y_offset=4, alpha=45)
+            lay = QVBoxLayout(card);
+            lay.setContentsMargins(14, 14, 14, 14);
+            lay.setSpacing(8)
+            t = QLabel(title);
+            t.setStyleSheet(f"color:{Theme.MUTED};")
+            v = QLabel("—");
+            v.setStyleSheet("font-size:26px; font-weight:800;")
+            lay.addWidget(t);
+            lay.addWidget(v)
+            h_resume.addWidget(card)
+            self.lbl_resumo[title] = v
+        v_perf.addLayout(h_resume)
+        self.tbl = QTableWidget(0, 4)
+        self.tbl.setHorizontalHeaderLabels(["Vaga", "Nome", "Matrícula", "Gerência"])
+        v_perf.addWidget(self.tbl, 1)
+
+        # --- Painel extra de indicadores (vindos de Relatórios) na aba Desempenho ---
+
+        # --- Painel extra de indicadores (apenas Gerências Usuárias e Percentual Sexo) ---
+        self.lbl_perf_extra = {}
+        h_perf_extra = QHBoxLayout()
+        h_perf_extra.setSpacing(12)
+
+        for title in ["Gerências Usuárias", "Percentual"]:
+            card = QFrame()
+            card.setStyleSheet(
+                f"background:{Theme.SURFACE}; border: 1px solid {Theme.BORDER_SOFT}; border-radius:12px;")
+            add_soft_shadow(card, blur=22, y_offset=4, alpha=45)
+            lay = QVBoxLayout(card)
+            lay.setContentsMargins(14, 14, 14, 14);
+            lay.setSpacing(8)
+            t = QLabel(title);
+            t.setStyleSheet(f"color:{Theme.MUTED}; font-weight:bold;")
+            v = QLabel("—");
+            v.setStyleSheet("font-size:22px; font-weight:800;")
+            lay.addWidget(t);
+            lay.addWidget(v)
+            h_perf_extra.addWidget(card)
+            self.lbl_perf_extra[title] = v
+
+        v_perf.addLayout(h_perf_extra)
+
+        # Relatórios
+        if self.is_admin:
+            # --- RELATÓRIOS (apenas Top 10 e Kits) ---
+            self.tab_rel = QWidget()
+            self.tabs.addTab(self.tab_rel, "📊 Relatórios")
+            v_rel = QVBoxLayout(self.tab_rel)
+            v_rel.setContentsMargins(12, 12, 12, 12)
+            v_rel.setSpacing(12)
+
+            # Header da aba + botão de atualizar
+            h_rel_hdr = QHBoxLayout()
+            lbl_rel_title = QLabel("Relatórios Diários e Semanais")
+            lbl_rel_title.setStyleSheet("font-weight:800; font-size:16px; color:#0F172A;")
+            h_rel_hdr.addWidget(lbl_rel_title)
+            h_rel_hdr.addStretch(1)
+            btn_rel_up = QPushButton("🔄 Atualizar")
+            btn_rel_up.clicked.connect(self.refresh_relatorios)
+            h_rel_hdr.addWidget(btn_rel_up)
+            v_rel.addLayout(h_rel_hdr)
+
+            # --- Card TOP 10 ---
+            card_top10 = QFrame()
+            card_top10.setStyleSheet(
+                f"background:{Theme.SURFACE}; border:1px solid {Theme.BORDER_SOFT}; border-radius:12px;")
+            add_soft_shadow(card_top10, blur=22, y_offset=4, alpha=45)
+            lay_top10 = QVBoxLayout(card_top10);
+            lay_top10.setContentsMargins(16, 16, 16, 16);
+            lay_top10.setSpacing(8)
+
+            title_top10 = QLabel("🏆 TOP 10 HÓSPEDES MAIS FREQUENTES (PERSISTENTE)")
+            title_top10.setStyleSheet("font-weight:800; color:#0F172A;")
+            subtitle_top10 = QLabel("Fonte: Ranking persistente por gerência • Atualização automática")
+            subtitle_top10.setStyleSheet("color:#6B7280;")
+            lay_top10.addWidget(title_top10)
+            lay_top10.addWidget(subtitle_top10)
+
+            # Tabela Top10
+            self.tbl_top10 = QTableWidget(0, 4)
+            self.tbl_top10.setHorizontalHeaderLabels(["Posição", "Nome", "Gerência", "Passagens"])
+            self.tbl_top10.horizontalHeader().setStretchLastSection(True)
+            self.tbl_top10.horizontalHeader().setDefaultAlignment(Qt.AlignLeft)
+            self.tbl_top10.setAlternatingRowColors(True)
+            self.tbl_top10.setStyleSheet("""
+            QTableWidget {
+              background: #FFFFFF; border: 1px solid rgba(0,0,0,0.08); border-radius:10px;
+            }
+            QHeaderView::section {
+              background: #F3F4F8; color: #0F172A; font-weight:700; padding:6px; border:none;
+            }
+            """)
+            lay_top10.addWidget(self.tbl_top10)
+            v_rel.addWidget(card_top10)
+
+            # --- Card KITS ---
+            card_kits = QFrame()
+            card_kits.setStyleSheet(
+                f"background:{Theme.SURFACE}; border:1px solid {Theme.BORDER_SOFT}; border-radius:12px;")
+            add_soft_shadow(card_kits, blur=22, y_offset=4, alpha=45)
+            lay_kits = QVBoxLayout(card_kits);
+            lay_kits.setContentsMargins(16, 16, 16, 16);
+            lay_kits.setSpacing(8)
+
+            title_kits = QLabel("🧴 KITS ENTREGUES (últimas liberações)")
+            title_kits.setStyleSheet("font-weight:800; color:#0F172A;")
+            subtitle_kits = QLabel("Campos: Nome, Gerência, Qtde, Valor (R$) • Janela: últimas 50 liberações")
+            subtitle_kits.setStyleSheet("color:#6B7280;")
+            lay_kits.addWidget(title_kits)
+            lay_kits.addWidget(subtitle_kits)
+
+            # Tabela Kits
+            self.tbl_kits = QTableWidget(0, 4)
+            self.tbl_kits.setHorizontalHeaderLabels(["Nome", "Gerência", "Kits", "Valor (R$)"])
+            self.tbl_kits.horizontalHeader().setStretchLastSection(True)
+            self.tbl_kits.setAlternatingRowColors(True)
+            self.tbl_kits.setStyleSheet("""
+            QTableWidget {
+              background: #FFFFFF; border: 1px solid rgba(0,0,0,0.08); border-radius:10px;
+            }
+            QHeaderView::section {
+              background: #F3F4F8; color: #0F172A; font-weight:700; padding:6px; border:none;
+            }
+            """)
+            lay_kits.addWidget(self.tbl_kits)
+
+            # Rodapé de totais
+            foot = QHBoxLayout()
+            self.lbl_total_kits = QLabel("Total de Kits: —")
+            self.lbl_total_val = QLabel("Valor Total: R$ —")
+            self.lbl_total_kits.setStyleSheet("font-weight:700; color:#0F172A;")
+            self.lbl_total_val.setStyleSheet("font-weight:700; color:#0F172A;")
+            foot.addWidget(self.lbl_total_kits)
+            foot.addStretch(1)
+            foot.addWidget(self.lbl_total_val)
+            lay_kits.addLayout(foot)
+            v_rel.addWidget(card_kits)
+
+            # Barra de ações
+            h_rel_btns = QHBoxLayout()
+            btn_email = QPushButton("📧 Enviar aos Admins")
+            btn_email.clicked.connect(self.enviar_relatorio_admins)
+            btn_copy = QPushButton("📋 Copiar")
+            btn_copy.clicked.connect(self.copiar_relatorios)
+            btn_excel_full = QPushButton("📈 Relatório Completo Excel")
+            btn_excel_full.clicked.connect(self.gerar_relatorio_completo)
+            h_rel_btns.addWidget(btn_email)
+            h_rel_btns.addStretch(1)
+            h_rel_btns.addWidget(btn_copy)
+            h_rel_btns.addWidget(btn_excel_full)
+            v_rel.addLayout(h_rel_btns)
+
+        # Mapa - AGORA VISÍVEL PARA TODOS
+        self.tab_mapa = QWidget();
+        self.tabs.addTab(self.tab_mapa, "🗺️ Mapa Reservas")
+        v_mapa = QVBoxLayout(self.tab_mapa);
+        v_mapa.setContentsMargins(8, 8, 8, 8);
+        v_mapa.setSpacing(12)
+        h_map = QHBoxLayout()
+        h_map.addWidget(QLabel("Mapa de Reservas (Quartos x Dias)"))
+        btn_map_up = QPushButton("🔄 Atualizar mapa");
+        btn_map_up.clicked.connect(self.refresh_mapa_from_model)
+        h_map.addStretch(1);
+        h_map.addWidget(btn_map_up)
+        v_mapa.addLayout(h_map)
+        # >>> NOVO: ScrollArea para o mapa <<<
+        self.map_scroll = QScrollArea()
+        self.map_scroll.setWidgetResizable(True)
+        self.map_container = QWidget()
+        self.map_scroll.setWidget(self.map_container)
+        self.map_grid = QGridLayout(self.map_container)
+        self.map_grid.setHorizontalSpacing(8)
+        self.map_grid.setVerticalSpacing(8)
+        v_mapa.addWidget(self.map_scroll, 1)
+
+        # Usuários (admin) + Configurações (admin)
+        self._mount_user_tabs()
+        if self.is_admin:
+            self._mount_config_tab()
+        # inicializa
+        self.render_room_cards()
+        self.update_kpis()
+        self.refresh_desempenho()
+
+        # Atualiza o mapa para todos
+        self.refresh_mapa_from_model()
+
+        if self.is_admin:
+            self.refresh_relatorios()
+
+        self._install_close_mark_offline()
+
+    # === Sair ===
+    def logout(self):
+        try:
+            if self.usuario_ativo:
+                atualizar_status_usuario(self.usuario_ativo, "offline")
+        except Exception:
+            pass
+        self.close()
+
+    # === Banner Detalhes ===
+    def show_alert_details(self):
+        stats = self._last_alert_stats or {}
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Detalhes do Alerta de Ocupação")
+        self._center_dialog(dlg, 560, 320)
+        v = QVBoxLayout(dlg);
+        v.setContentsMargins(16, 16, 16, 16);
+        v.setSpacing(10)
+        info = QFrame();
+        add_soft_shadow(info)
+        lay = QVBoxLayout(info);
+        lay.setContentsMargins(12, 12, 12, 12)
+
+        def line(txt): lay.addWidget(QLabel(txt))
+
+        line(f"• Total de quartos: {stats.get('total_quartos', '—')}")
+        line(f"• Indisponíveis (ocupados/bloqueados): {stats.get('indisponiveis', '—')} ({stats.get('percent', '—')}%)")
+        line(f"• Quartos ocupados: {stats.get('ocupados', '—')}")
+        line(f"• Quartos bloqueados: {stats.get('bloqueados', '—')}")
+        line(f"• Quartos livres: {stats.get('livres', '—')}")
+        v.addWidget(info)
+        tip = QLabel("Dica: libere quartos ou ajuste políticas para reduzir a indisponibilidade.")
+        tip.setStyleSheet("color:#6B7280;")
+        v.addWidget(tip)
+        h = QHBoxLayout();
+        h.addStretch(1)
+        btn = QPushButton("Fechar");
+        btn.clicked.connect(dlg.accept)
+        h.addWidget(btn);
+        v.addLayout(h)
+        dlg.exec()
+
+    # === LIBERAR CAMA ===
+    def liberar_cama(self, q: Quarto, c: Cama):
+        today = dt.date.today()
+        now_str = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+        active_idx, active_res = c.get_active_reservation(today)
+        if active_res is None:
+            _, next_res = c.get_next_reservation(today)
+            c.status = "AGENDADO" if next_res else "DISPONÍVEL"
+            c.last_modified_at = now_str
+            c.released_at = now_str
+            c.operador_liberacao = self.usuario_ativo or c.operador_liberacao or ""
+            try:
+                salvar_quartos_firebase(self.quartos)
+            except Exception as e:
+                print("Warn salvar_quartos_firebase:", e)
+            self.refresh_all()
+            QMessageBox.information(self, "Liberação",
+                                    f"Cama {c.idx} do Quarto {q.number} não estava com reserva ativa.\n"
+                                    f"Status ajustado para: {c.status}.")
+            return
+        try:
+            ci_date = dt.datetime.strptime(active_res.get("check_in", ""), "%d/%m/%Y").date()
+            co_date = dt.datetime.strptime(active_res.get("check_out", ""), "%d/%m/%Y").date()
+        except Exception:
+            ci_date = co_date = None
+
+        def _days_reserved(ci, co):
+            return ((co - ci).days + 1) if (ci and co and co >= ci) else 0
+
+        def _kits_for(ci, co):
+            return (((_days_reserved(ci, co) + 1) // 2)) if _days_reserved(ci, co) > 0 else 0
+
+        days_reserved = _days_reserved(ci_date, co_date)
+        kits_qty = _kits_for(ci_date, co_date)
+        kits_total_value = round(kits_qty * KIT_PRICE, 2)
+        dur_hours = None
+        try:
+            dur_hours = round((dt.datetime.now() - dt.datetime.combine(ci_date, dt.time())).total_seconds() / 3600, 1)
+        except Exception:
+            pass
+        c.operador_liberacao = self.usuario_ativo or c.operador_liberacao or ""
+        hist_entry = {
+            "nome": active_res.get("nome", ""),
+            "gerencia": active_res.get("gerencia", ""),
+            "matricula": active_res.get("matricula", ""),
+            "quarto": q.number,
+            "cama": c.idx,
+            "check_in": active_res.get("check_in", ""),
+            "check_out": active_res.get("check_out", ""),
+            "released_at": now_str,
+            "duracao_horas": dur_hours,
+            "days_reserved": days_reserved,
+            "kits_qty": kits_qty,
+            "kits_total_value": kits_total_value,
+            "operador_liberacao": c.operador_liberacao,
+        }
+        try:
+            append_historico(hist_entry);
+            self.historico.append(hist_entry)
+        except Exception as e:
+            print("Warn: não foi possível registrar histórico:", e)
+        try:
+            incrementa_ranking(active_res.get("nome", ""), active_res.get("gerencia", ""))
+            self.ranking = carregar_ranking()
+        except Exception as e:
+            print("Warn: ranking não atualizado:", e)
+        _ = c.remove_reservation(active_idx)
+        _, next_res = c.get_next_reservation(today)
+        c.status = "AGENDADO" if next_res else "DISPONÍVEL"
+        c.note = ""
+        c.released_at = now_str
+        c.last_modified_at = now_str
+        c.last_action_by = self.usuario_ativo or c.last_action_by
+        c.last_action_at = now_str
+        c.last_action = "LIBERAÇÃO"
+        try:
+            salvar_quartos_firebase(self.quartos)
+        except Exception as e:
+            print("Warn salvar_quartos_firebase:", e)
+        self.refresh_all()
+        msg = (f"✅ Cama {c.idx} do Quarto {q.number} liberada.\n"
+               f"• Hóspede: {active_res.get('nome', '—')} ({active_res.get('gerencia', '—')})\n"
+               f"• Período: {active_res.get('check_in', '—')} → {active_res.get('check_out', '—')}\n"
+               f"• Dias: {days_reserved} \n Kits: {kits_qty} \n Valor kits: R$ {kits_total_value:.2f}\n"
+               f"• Novo status: {c.status}")
+        QMessageBox.information(self, "Liberação", msg)
+
+    # === Alterar status manual ===
+    def set_status_cama(self, q: Quarto, c: Cama, new_status: str):
+        now_str = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+        new_status = (new_status or "").strip().upper()
+        valid = {"DISPONÍVEL", "RESERVADO", "INTERDITADO", "LIMPEZA", "AGENDADO"}
+        if new_status not in valid:
+            QMessageBox.warning(self, "Status", f"Status inválido: {new_status}")
+            return
+        if new_status == "DISPONÍVEL":
+            ai, ar = c.get_active_reservation(dt.date.today())
+            if ar:
+                ret = QMessageBox.question(self, "Liberação necessária",
+                                           "Há reserva ativa hoje. Deseja liberar (remover reserva e registrar histórico)?",
+                                           QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                if ret == QMessageBox.Yes:
+                    self.liberar_cama(q, c)
+                    return
+        c.interditado_motivo = ""
+        c.last_action_by = self.usuario_ativo or ""
+        c.last_action_at = now_str
+        c.last_action = new_status
+        if new_status == "DISPONÍVEL":
+            _, nxt = c.get_next_reservation(dt.date.today())
+            c.status = "AGENDADO" if nxt else "DISPONÍVEL"
+            c.operador_liberacao = c.last_action_by
+        elif new_status == "INTERDITADO":
+            motivo, ok = QInputDialog.getText(self, "Motivo do bloqueio", "Informe o motivo:")
+            if not ok:
+                return
+            c.interditado_motivo = (motivo or "").strip()
+            c.status = "INTERDITADO"
+            c.operador_bloqueio = c.last_action_by
+        elif new_status == "LIMPEZA":
+            c.status = "LIMPEZA"
+        elif new_status in {"OCUPADO", "AGENDADO"}:
+            c.status = new_status
+        c.last_modified_at = now_str
+        try:
+            salvar_quartos_firebase(self.quartos)
+        except Exception as e:
+            print("Warn salvar_quartos_firebase:", e)
+        self.refresh_all()
+
+    # === Política de bloqueio de quarto (KPIs) ===
+    def _is_room_blocked(self, q: Quarto):
+        policy = (self.config.get("blocked_room_policy", "any_bed") or "any_bed").strip().lower()
+        beds = list(q.camas.values())
+        if policy == "both_beds":
+            return all(c.interdited for c in beds)
+        return any(c.interdited for c in beds)
+
+    # === Sync por data (auto) ===
+    def sync_status_by_date(self):
+        """
+        Sincroniza status pela data, mas respeita a validação do código.
+        - Se for hoje + PENDENTE -> Mantém AGENDADO (Azul).
+        - Se for hoje + CONFIRMADO -> Muda para RESERVADO (Vermelho).
+        """
+        today = dt.date.today()
+        now_str = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+
+        for q in self.quartos.values():
+            for c in q.camas.values():
+                # 1. Se estiver bloqueado manualmente ou em limpeza, não toca
+                if c.interdited or c.cleaning:
+                    continue
+
+                # 2. Verifica se tem reserva ativa para HOJE (check-in <= hoje <= check-out)
+                active_idx, active_res = c.get_active_reservation(today)
+
+                if active_res:
+                    # Verifica o status da confirmação (código)
+                    # Se não tiver a chave (reserva antiga), assume CONFIRMADO para não travar
+                    status_conf = active_res.get("status_confirmacao", "CONFIRMADO")
+
+                    if status_conf == "PENDENTE":
+                        # É hoje, mas falta o código: Força AGENDADO (Azul)
+                        if c.status != "AGENDADO":
+                            c.status = "AGENDADO"
+                            c.last_modified_at = now_str
+                    else:
+                        # É hoje e já validou o código: Força RESERVADO (Vermelho)
+                        if c.status != "OCUPADO":
+                            c.status = "OCUPADO"
+                            c.last_modified_at = now_str
+                    continue
+
+                # 3. Se não tem reserva para hoje, verifica o futuro
+                _, next_res = c.get_next_reservation(today)
+                new_status = "AGENDADO" if next_res else "DISPONÍVEL"
+
+                if c.status != new_status:
+                    c.status = new_status
+                    c.last_modified_at = now_str
+
+    def auto_refresh(self):
+        self.sync_status_by_date()
+        self.refresh_all()
+
+    def refresh_all(self):
+        self.render_room_cards()
+        self.update_kpis()
+        self.refresh_desempenho()
+        self.refresh_mapa_from_model()
+        if self.is_admin:
+            self.refresh_relatorios()
+
+    # === Filtros ===
+    def apply_filter(self):
+        q = (self.search_entry.text() or "").strip().lower()
+        self.filtered = None if not q else set()
+        for qkey, quarto in self.quartos.items():
+            match = False
+            for c in quarto.camas.values():
+                reservas_text = []
+                for r in c.reservations:
+                    reservas_text.extend([
+                        r.get("nome", ""), r.get("matricula", ""), r.get("gerencia", ""),
+                        r.get("genero", ""), r.get("obs", ""), r.get("check_in", ""), r.get("check_out", ""),
+                        r.get("operador_reserva", ""), r.get("updated_by", ""),
+                        r.get("contato", ""), r.get("centro_custo", ""),
+                    ])
+                hay = " ".join([quarto.number, c.idx, c.status, c.note or "", c.contato or ""] + reservas_text).lower()
+                if not q or q in hay:
+                    match = True;
+                    break
+            if match and self.filtered is not None:
+                self.filtered.add(qkey)
+        self.render_room_cards()
+        self.update_kpis()
+        self.refresh_desempenho()
+
+    def clear_filter(self):
+        self.search_entry.setText("")
+        self.filtered = None
+        self.render_room_cards()
+        self.update_kpis()
+        self.refresh_desempenho()
+
+    # === Cards ===
+    def status_color_cama(self, c: Cama):
+        if c.reserved: return Theme.ACCENT
+        if c.interdited: return Theme.WARNING
+        if c.cleaning: return Theme.SUCCESS
+        if c.scheduled: return Theme.SCHEDULED
+        if c.available: return Theme.NEUTRAL
+        return Theme.NEUTRAL
+
+    def render_room_cards(self):
+        for i in reversed(range(self.grid_layout.count())):
+            item = self.grid_layout.itemAt(i)
+            w = item.widget()
+            if w: w.setParent(None)
+        keys = sorted(self.quartos.keys(), key=lambda k: int(k))
+        if self.filtered is not None:
+            keys = [k for k in keys if k in self.filtered]
+        cols = 6
+        for idx, key in enumerate(keys):
+            row, col = divmod(idx, cols)
+            card = self._make_room_card(self.quartos[key])
+            self.grid_layout.addWidget(card, row, col)
+
+    def _make_room_card(self, q: Quarto):
+        card = QFrame();
+        card.setMinimumSize(QSize(230, 200))
+        card.setStyleSheet(f"background:{Theme.SURFACE}; border: 1px solid {Theme.BORDER_SOFT}; border-radius:14px;")
+        add_soft_shadow(card, blur=24, y_offset=4, alpha=50)
+        v = QVBoxLayout(card);
+        v.setContentsMargins(12, 12, 12, 12);
+        v.setSpacing(10)
+        # header
+        h = QHBoxLayout()
+        title = QLabel(f"Quarto {q.number}");
+        title.setStyleSheet("font-weight:800;")
+        h.addWidget(title);
+        h.addStretch(1)
+        # OBS badge
+        room_has_obs = any(any((r.get("obs", "").strip()) for r in c.reservations) for c in q.camas.values())
+        room_blink_on = any(any(bool(r.get("obs_blink", False)) for r in c.reservations) for c in q.camas.values())
+        if room_has_obs:
+            # mantém controle via obs_blink (liga/desliga) e marca automático no salvar
+            self._add_blink_badge(h, "OBS", Theme.WARNING, room_blink_on, lambda: self.show_obs_quarto(q))
+        # overdue
+        today = dt.date.today()
+        room_overdue = False
+        for c in q.camas.values():
+            ai, ar = c.get_active_reservation(today)
+            if ar:
+                try:
+                    co_date = dt.datetime.strptime(ar.get("check_out", ""), "%d/%m/%Y").date()
+                    if today > co_date:
+                        room_overdue = True;
+                        break
+                except:
+                    pass
+        if room_overdue:
+            self._add_blink_badge(h, "⚠ SAÍDA VENCIDA", Theme.DANGER, True, None)
+        v.addLayout(h)
+        # body
+        hb = QHBoxLayout();
+        hb.setSpacing(10)
+        for cama_id in ["A", "B"]:
+            c = q.camas[cama_id]
+            slot = QFrame()
+            slot.setStyleSheet(f"border: 1px solid {Theme.BORDER_SOFT}; border-radius:12px;")
+            vb = QVBoxLayout(slot);
+            vb.setContentsMargins(0, 0, 0, 0);
+            vb.setSpacing(6)
+            bar = QFrame();
+            bar.setFixedHeight(6)
+            bar.setStyleSheet(f"background:{self.status_color_cama(c)}; border-radius:6px;")
+            vb.addWidget(bar)
+            inner = QFrame();
+            inner.setStyleSheet(f"border: none;")
+            inner_l = QVBoxLayout(inner);
+            inner_l.setContentsMargins(8, 8, 8, 8);
+            inner_l.setSpacing(6)
+            top = QHBoxLayout()
+            lbl_cama = QLabel(f"Cama {cama_id}");
+            lbl_cama.setStyleSheet(f"color:{Theme.MUTED}; font-weight:bold;")
+            top.addWidget(lbl_cama);
+            top.addStretch(1)
+            if c.female_only:
+                fem = QLabel("Feminino")
+                fem.setStyleSheet(
+                    f"background:{Theme.MAGENTA}; color:white; padding:2px 6px; font-size:11px; border-radius:6px;")
+                top.addWidget(fem)
+            _, next_res = c.get_next_reservation(dt.date.today())
+            ai, active_res = c.get_active_reservation(dt.date.today())
+            if not active_res and next_res:
+                tag = QLabel("Agendado")
+                tag.setStyleSheet(
+                    f"background:{Theme.SCHEDULED}; color:white; padding:2px 6px; font-size:11px; border-radius:6px;")
+                top.addWidget(tag)
+            inner_l.addLayout(top)
+            res = active_res if active_res else next_res
+            nome = (res or {}).get("nome", "").strip()
+            if nome:
+                nm = QLabel(nome)
+                nm.setStyleSheet(f"color:{Theme.ACCENT if active_res else Theme.MUTED}; font-weight:800;")
+                inner_l.addWidget(nm)
+            ger = (res or {}).get("gerencia", "").strip()
+            if ger:
+                ge = QLabel(ger);
+                ge.setStyleSheet(f"background:#EEF2FF; color:{Theme.ACCENT}; padding:2px 6px; border-radius:6px;")
+                inner_l.addWidget(ge)
+            st = QLabel(c.status);
+            st.setStyleSheet(f"color:{Theme.MUTED};")
+            inner_l.addWidget(st)
+            if c.interditado_motivo and c.interdited:
+                mot = QLabel(f"Motivo: {c.interditado_motivo}")
+                mot.setStyleSheet("color:#7F1D1D; font-size:11px;")
+                inner_l.addWidget(mot)
+            slot.mousePressEvent = partial(self._on_slot_click, q, c)
+            slot.setContextMenuPolicy(Qt.CustomContextMenu)
+            slot.customContextMenuRequested.connect(
+                lambda pos, q=q, c=c, w=slot: self._context_menu_cama(q, c, w.mapToGlobal(pos)))
+            vb.addWidget(inner)
+            hb.addWidget(slot)
+        v.addLayout(hb)
+        return card
+
+    def _on_slot_click(self, q: Quarto, c: Cama, event):
+        self.open_actions_cama(q, c, event)
+
+    def _add_blink_badge(self, layout: QHBoxLayout, text: str, base_color: str, blink: bool, on_click):
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"background:{base_color}; color:white; padding:3px 8px; font-size:11px; border-radius:8px;")
+        if on_click:
+            lbl.mousePressEvent = lambda e: on_click()
+        layout.addWidget(lbl)
+        if blink:
+            timer = QTimer(lbl)
+
+            def _toggle():
+                state = lbl.property("blink_state")
+                lbl.setProperty("blink_state", not bool(state))
+                new_bg = base_color if not bool(state) else "#FCA5A5"
+                lbl.setStyleSheet(
+                    f"background:{new_bg}; color:white; padding:3px 8px; font-size:11px; border-radius:8px;")
+
+            timer.timeout.connect(_toggle)
+            lbl.setProperty("blink_state", False)
+            timer.start(700)
+
+    def _context_menu_cama(self, q: Quarto, c: Cama, global_pos):
+        menu = QMenu(self)
+
+        # Opções básicas
+        act_res = QAction("Reservar...", self);
+        act_res.triggered.connect(lambda: self.open_reservation_tab(q, c, "new"))
+        menu.addAction(act_res)
+
+        if len(c.reservations) > 0:
+            act_edit = QAction("Editar reserva...", self);
+            act_edit.triggered.connect(lambda: self.open_reservation_tab(q, c, "edit"))
+            menu.addAction(act_edit)
+
+        menu.addSeparator()
+
+        # === AQUI ESTÁ O BOTÃO DE CONFIRMAR ===
+        if len(c.reservations) > 0:
+            act_conf = QAction("✅ Confirmar Check-in (Digitar Código)", self)
+            # Chama a função de validação na reserva ativa (índice 0 ou busca ativa)
+            act_conf.triggered.connect(lambda: self.validar_codigo_reserva(q, c, 0))
+            menu.addAction(act_conf)
+        # =======================================
+
+        menu.addSeparator()
+
+        act_lib = QAction("Liberar (Checkout)", self);
+        act_lib.triggered.connect(lambda q=q, c=c: self.liberar_cama(q, c))
+
+        act_blk = QAction("Bloquear (Interditar)", self);
+        act_blk.triggered.connect(lambda: self.set_status_cama(q, c, "INTERDITADO"))
+
+        menu.addAction(act_lib)
+        menu.addAction(act_blk)
+
+        menu.exec(global_pos)
+
+        act_confirmar = QAction("Confirmar reserva (código)", self)
+        act_confirmar.triggered.connect(
+            lambda: self.validar_codigo_reserva(q, c, 0)
+        )
+        menu.addAction(act_confirmar)
+
+    # === Diálogo de ações (visual melhorado) ===
+    def open_actions_cama(self, q: Quarto, c: Cama, event=None):
+        """Diálogo compacto de ações para uma cama ao clicar no 'slot' do cartão."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Ações — Quarto {q.number} • Cama {c.idx}")
+        self._center_dialog(dlg, 580, 420)  # Aumentei um pouco a altura
+
+        # ... (Estilos CSS permanecem iguais, omitidos para economizar espaço) ...
+        dlg.setStyleSheet(f"""
+           QDialog {{ background: {Theme.APP_BG}; }}
+           QFrame {{ background: {Theme.SURFACE}; border: 1px solid {Theme.BORDER_SOFT}; border-radius: 12px; }}
+           QLabel {{ color: {Theme.TEXT}; font-size: 14px; }}
+           QPushButton {{ padding: 10px 14px; border-radius: 10px; font-weight: 700; border: 1px solid {Theme.BORDER_SOFT}; }}
+           QPushButton.primary {{ background: {Theme.PRIMARY}; color: white; }}
+           QPushButton.success {{ background: {Theme.SUCCESS}; color: white; }}
+           QPushButton.warn {{ background: {Theme.WARNING}; color: white; }}
+           QPushButton.danger {{ background: {Theme.DANGER}; color: white; }}
+           QPushButton.purple {{ background: #7C3AED; color: white; }} /* Cor nova para confirmar */
+           """)
+
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(10)
+
+        # Header
+        header = QHBoxLayout()
+        title = QLabel(f"Status atual: {c.status}")
+        title.setStyleSheet("font-weight:800;")
+        header.addWidget(title)
+        header.addStretch(1)
+        v.addLayout(header)
+
+        # Info Card
+        info_card = QFrame()
+        add_soft_shadow(info_card)
+        info_lay = QVBoxLayout(info_card)
+        info_lay.setContentsMargins(12, 12, 12, 12)
+
+        hoje = dt.date.today()
+        ai, ar = c.get_active_reservation(hoje)
+        _, nxt = c.get_next_reservation(hoje)
+
+        def _resumo(res):
+            if not res: return "—"
+            return f"{res.get('nome', '—')} • {res.get('gerencia', '—')} ({res.get('check_in', '')} → {res.get('check_out', '')})"
+
+        info_lay.addWidget(QLabel(f"Reserva ativa: {_resumo(ar)}"))
+        info_lay.addWidget(QLabel(f"Próxima reserva: {_resumo(nxt)}"))
+
+        # Mostra se está pendente de código
+        if ar and ar.get("status_confirmacao") == "PENDENTE":
+            lbl_pend = QLabel("⚠ AGUARDANDO CÓDIGO DE CONFIRMAÇÃO")
+            lbl_pend.setStyleSheet("color: #D97706; font-weight:bold;")
+            info_lay.addWidget(lbl_pend)
+
+        if c.interditado_motivo and c.interdited:
+            mot = QLabel(f"Bloqueio: {c.interditado_motivo}")
+            mot.setStyleSheet("color:#7F1D1D;")
+            info_lay.addWidget(mot)
+
+        v.addWidget(info_card)
+
+        actions = QGridLayout()
+        actions.setHorizontalSpacing(10)
+        actions.setVerticalSpacing(10)
+
+        btn_reservar = QPushButton("Reservar…")
+        btn_reservar.setProperty("class", "primary")
+
+        btn_editar = QPushButton("Editar reserva…")
+        btn_editar.setProperty("class", "primary")
+        btn_confirmar = QPushButton("✅ Confirmar Check-in (Código)")
+        btn_confirmar.setProperty("class", "purple")
+        # Só habilita se tiver reserva
+        btn_confirmar.setEnabled(len(c.reservations) > 0)
+
+        btn_liberar = QPushButton("Liberar")
+        btn_liberar.setProperty("class", "success")
+
+        btn_bloq = QPushButton("Bloquear")
+        btn_bloq.setProperty("class", "danger")
+
+        # Conexões
+        btn_reservar.clicked.connect(lambda: (self.open_reservation_tab(q, c, "new"), dlg.accept()))
+        btn_editar.clicked.connect(lambda: (self.open_reservation_tab(q, c, "edit"), dlg.accept()))
+
+        # Ação do botão confirmar
+        btn_confirmar.clicked.connect(lambda: (self.validar_codigo_reserva(q, c, 0), dlg.accept()))
+
+        btn_liberar.clicked.connect(lambda: (self.liberar_cama(q, c), dlg.accept()))
+        btn_bloq.clicked.connect(lambda: (self.set_status_cama(q, c, "INTERDITADO"), dlg.accept()))
+
+        st = self.style()
+        btn_reservar.setIcon(st.standardIcon(QStyle.SP_FileDialogNewFolder))
+        btn_editar.setIcon(st.standardIcon(QStyle.SP_FileDialogDetailedView))
+        btn_liberar.setIcon(st.standardIcon(QStyle.SP_DialogApplyButton))
+        btn_bloq.setIcon(st.standardIcon(QStyle.SP_MessageBoxCritical))
+        btn_editar.setEnabled(len(c.reservations) > 0)
+
+
+        # Layout dos botões (3 linhas)
+        # Linha 0: Confirmar (destaque)
+        actions.addWidget(btn_confirmar, 0, 0, 1, 2)  # Ocupa 2 colunas
+
+        # Linha 1: Reservar / Editar
+        actions.addWidget(btn_reservar, 1, 0)
+        actions.addWidget(btn_editar, 1, 1)
+
+        # Linha 2: Liberar / Bloquear
+        actions.addWidget(btn_liberar, 2, 0)
+        actions.addWidget(btn_bloq, 2, 1)
+
+        v.addLayout(actions)
+
+        foot = QHBoxLayout()
+        foot.addStretch(1)
+        btn_close = QPushButton("Fechar")
+        btn_close.setProperty("class", "primary")
+        btn_close.clicked.connect(dlg.reject)
+        foot.addWidget(btn_close)
+        v.addLayout(foot)
+
+        dlg.exec()
+
+    # === Reserva / Edição de reserva (PPG, sem  OBS pisca automático) ===
+    def open_reservation_tab(self, q: Quarto, c: Cama, mode: str = "new"):
+        """
+        Abre um diálogo para criar ou editar reservas da cama selecionada.
+        - mode: "new" para nova reserva; "edit" para editar existente (selecionável).
+        """
+        mode = (mode or "new").lower().strip()
+        dlg = QDialog(self)
+        dlg.setWindowTitle(
+            ("Nova Reserva" if mode == "new" else "Editar Reserva") + f" — Quarto {q.number} • Cama {c.idx}")
+        self._center_dialog(dlg, 680, 650)  # Aumentado para acomodar o botão de cancelar
+
+        v = QVBoxLayout(dlg);
+        v.setContentsMargins(16, 16, 16, 16);
+        v.setSpacing(10)
+        v.addWidget(QLabel(f"Quarto {q.number} • Cama {c.idx}"))
+
+        # Seleção da reserva quando modo edit
+        sel_idx = None
+        cb_sel = None
+        if mode == "edit":
+            if not c.reservations:
+                QMessageBox.information(self, "Editar reserva", "Não há reservas para editar nesta cama.")
+                return
+            cb_sel = QComboBox()
+            for i, r in enumerate(c.reservations):
+                nm = r.get("nome", "—");
+                ci = r.get("check_in", "—");
+                co = r.get("check_out", "—")
+                cb_sel.addItem(f"{i:02d} • {nm} • {ci} → {co}", userData=i)
+
+            def on_change(idx):
+                nonlocal sel_idx
+                sel_idx = cb_sel.currentData()
+                fill_form_from_res(sel_idx)
+
+            cb_sel.currentIndexChanged.connect(on_change)
+            v.addWidget(QLabel("Selecione a reserva para editar:"))
+            v.addWidget(cb_sel)
+            sel_idx = 0  # default
+
+        # Formulário
+        form = QFormLayout();
+        form.setContentsMargins(0, 0, 0, 0);
+        form.setSpacing(8)
+        ed_nome = QLineEdit()
+        cb_genero = QComboBox();
+        cb_genero.addItems(["Masculino", "Feminino", "Outro"])
+        ed_matricula = QLineEdit()
+        ed_gerencia = QLineEdit()
+        ed_solicitante = QLineEdit()
+        ed_contato = QLineEdit()
+        ed_email = QLineEdit()
+        ed_email.setPlaceholderText("exemplo@empresa.com")
+        ed_ccusto = QLineEdit()
+        ed_ppg_resp = QLineEdit()
+        ed_ppg_num = QLineEdit()
+        ed_check_in = QLineEdit();
+        ed_check_in.setPlaceholderText("DD/MM/AAAA")
+        ed_check_out = QLineEdit();
+        ed_check_out.setPlaceholderText("DD/MM/AAAA")
+        ed_obs = QLineEdit()
+
+        form.addRow("Nome", ed_nome)
+        form.addRow("Gênero", cb_genero)
+        form.addRow("Matrícula", ed_matricula)
+        form.addRow("Gerência", ed_gerencia)
+        form.addRow("Solicitante da reserva", ed_solicitante)
+        form.addRow("Contato", ed_contato)
+        form.addRow("E-mail", ed_email)
+        form.addRow("Centro de Custo", ed_ccusto)
+        form.addRow("Responsável PPG", ed_ppg_resp)
+        form.addRow("Nº PPG", ed_ppg_num)
+        form.addRow("Check-in", ed_check_in)
+        form.addRow("Check-out", ed_check_out)
+
+        # Badge OBS piscando live quando houver texto
+        obs_row = QHBoxLayout()
+        badge_obs = QLabel("OBS")
+        badge_obs.setStyleSheet("background:#DC2626; color:white; padding:3px 8px; border-radius:8px; font-size:11px;")
+        badge_obs.hide()
+        obs_row.addWidget(QLabel("Observação"))
+        obs_row.addStretch(1)
+        obs_row.addWidget(badge_obs)
+        obs_label_container = QWidget();
+        obs_label_container.setLayout(obs_row)
+        form.addRow(obs_label_container, ed_obs)
+
+        v.addLayout(form)
+
+        obs_timer = QTimer(dlg)
+
+        def capture_with_opencv():
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                QMessageBox.warning(dlg, "Câmera", "Não foi possível abrir a câmera.")
+                return False
+            ret, frame = cap.read()
+            cap.release()
+            if not ret:
+                QMessageBox.warning(dlg, "Câmera", "Falha ao capturar a imagem.")
+                return False
+
+            base_dir = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation) or os.getcwd()
+            ts = QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
+            out_path = os.path.join(base_dir, f"hospede_{ts}.jpg")
+            cv2.imwrite(out_path, frame)
+
+            with open(out_path, "rb") as f:
+                h = hashlib.sha256(f.read()).hexdigest()
+
+        def _update_obs_blink():
+            has = bool((ed_obs.text() or "").strip())
+            if not has:
+                badge_obs.hide()
+                return
+            badge_obs.show()
+            st = badge_obs.property("blink_state")
+            badge_obs.setProperty("blink_state", not bool(st))
+            new_bg = "#B45309" if not bool(st) else "#DC2626"
+            badge_obs.setStyleSheet(
+                f"background:{new_bg}; color:white; padding:3px 8px; border-radius:8px; font-size:11px;")
+
+        obs_timer.timeout.connect(_update_obs_blink)
+        obs_timer.start(700)
+        ed_obs.textChanged.connect(lambda _: _update_obs_blink())
+
+        def fill_form_from_res(idx):
+            if idx is None or idx < 0 or idx >= len(c.reservations): return
+            r = c.reservations[idx]
+            ed_nome.setText(r.get("nome", ""))
+            cb_genero.setCurrentText(r.get("genero", "Masculino") or "Masculino")
+            ed_matricula.setText(r.get("matricula", ""))
+            ed_gerencia.setText(r.get("gerencia", ""))
+            ed_solicitante.setText(r.get("solicitante_reserva", ""))
+            ed_contato.setText(r.get("contato", ""))
+            ed_email.setText(r.get("email", ""))
+            ed_ccusto.setText(r.get("centro_custo", ""))
+            ed_ppg_resp.setText(r.get("ppg_responsavel", ""))
+            ed_ppg_num.setText(r.get("ppg_numero", ""))
+            ed_check_in.setText(r.get("check_in", ""))
+            ed_check_out.setText(r.get("check_out", ""))
+            ed_obs.setText(r.get("obs", ""))
+
+        if mode == "edit":
+            fill_form_from_res(sel_idx)
+
+        # Rodapé de Botões
+        h = QHBoxLayout();
+        h.setSpacing(10)
+
+        # --- NOVO: Botão Cancelar Agendamento (Apenas no modo Edit) ---
+        if mode == "edit":
+            btn_delete = QPushButton("🗑️ Cancelar Agendamento")
+            btn_delete.setStyleSheet(
+                f"background:{Theme.DANGER}; color:white; font-weight:700; padding:8px 12px; border-radius:10px;")
+
+            def do_cancel_reservation():
+                nonlocal sel_idx
+                if sel_idx is None: return
+
+                res = c.reservations[sel_idx]
+                ret = QMessageBox.question(dlg, "Confirmar Cancelamento",
+                                           f"Deseja realmente excluir a reserva de {res.get('nome')}?\nEsta ação não pode ser desfeita.",
+                                           QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+                if ret == QMessageBox.Yes:
+                    c.remove_reservation(sel_idx)
+                    # Recalcular Status da Cama
+                    hoje = dt.date.today()
+                    ai, ar = c.get_active_reservation(hoje)
+                    if ar:
+                        c.status = "OCUPADO"
+                    else:
+                        _, nxt = c.get_next_reservation(hoje)
+                        c.status = "AGENDADO" if nxt else "DISPONÍVEL"
+
+                    c.last_modified_at = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+                    c.last_action_by = self.usuario_ativo
+                    c.last_action = "CANCELAMENTO"
+
+                    try:
+                        salvar_quartos_firebase(self.quartos)
+                    except Exception as e:
+                        print("Erro ao salvar após cancelamento:", e)
+
+                    self.refresh_all()
+                    QMessageBox.information(dlg, "Sucesso", "Agendamento cancelado com sucesso.")
+                    dlg.accept()
+
+            btn_delete.clicked.connect(lambda: cancel_reservation_with_logging(self, q, c, sel_idx, dlg))
+            h.addWidget(btn_delete)
+
+        h.addStretch(1)
+        btn_cancel = QPushButton("Cancelar")
+        btn_save = QPushButton("Salvar")
+        h.addWidget(btn_cancel);
+        h.addWidget(btn_save)
+        v.addLayout(h)
+
+        def cancel_reservation_with_logging(self, q, c, sel_idx, dlg):
+            from PySide6.QtWidgets import QMessageBox, QInputDialog
+            import datetime as dt
+
+            if sel_idx is None or sel_idx < 0 or sel_idx >= len(c.reservations or []):
+                QMessageBox.warning(dlg, "Cancelar", "Seleção inválida.")
+                return
+
+            res = c.reservations[sel_idx]
+
+            ret = QMessageBox.question(
+                dlg, "Confirmar Cancelamento",
+                f"Deseja realmente excluir a reserva de {res.get('nome', '—')}?\nEsta ação não pode ser desfeita.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if ret != QMessageBox.Yes:
+                return
+            from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+            from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+            while True:
+                motivo, ok_m = QInputDialog.getText(
+                    dlg,
+                    "Motivo do Cancelamento (obrigatório)",
+                    "Informe o motivo do cancelamento:"
+                )
+
+                if not ok_m:
+                    # Usuário cancelou → aborta tudo
+                    QMessageBox.information(
+                        dlg,
+                        "Cancelamento abortado",
+                        "O cancelamento foi interrompido porque o motivo não foi informado."
+                    )
+                    return
+
+                motivo = (motivo or "").strip()
+
+                if motivo:
+                    break  # ✅ motivo válido, sai do loop
+
+                QMessageBox.warning(
+                    dlg,
+                    "Campo obrigatório",
+                    "⚠️ O motivo do cancelamento é obrigatório.\n\n"
+                    "Informe um motivo para prosseguir."
+                )
+
+            agora_str = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+            operador = getattr(self, 'usuario_ativo', '') or ''
+
+            hist_entry_cancel = {
+                "tipo": "CANCELAMENTO",
+                "nome": res.get("nome", ""),
+                "gerencia": res.get("gerencia", ""),
+                "matricula": res.get("matricula", ""),
+                "quarto": q.number,
+                "cama": c.idx,
+                "check_in": res.get("check_in", ""),
+                "check_out": res.get("check_out", ""),
+                "cancelado_em": agora_str,
+                "operador_cancelamento": operador,
+                "cancel_reason": motivo,
+                "obs": (res.get("obs") or ""),
+                "last_action_by": operador,
+                "last_action_at": agora_str,
+            }
+            try:
+                append_historico(hist_entry_cancel)
+                if hasattr(self, 'historico') and isinstance(self.historico, list):
+                    self.historico.append(hist_entry_cancel)
+            except Exception as e:
+                print('[Cancelamento] Warn: não foi possível registrar histórico:', e)
+
+            try:
+                c.remove_reservation(sel_idx)
+            except Exception as e:
+                print('[Cancelamento] Erro ao remover reserva:', e)
+
+            hoje = dt.date.today()
+            try:
+                ai, ar = c.get_active_reservation(hoje)
+            except Exception:
+                ai, ar = None, None
+            if ar:
+                c.status = 'OCUPADO'
+            else:
+                try:
+                    _, nxt = c.get_next_reservation(hoje)
+                except Exception:
+                    nxt = None
+                c.status = 'AGENDADO' if nxt else 'DISPONÍVEL'
+
+            c.last_modified_at = agora_str
+            c.last_action_by = operador
+            c.last_action = 'CANCELAMENTO'
+            c.last_action_at = agora_str
+
+            try:
+                salvar_quartos_firebase(self.quartos)
+            except Exception as e:
+                print('[Cancelamento] Erro ao salvar quartos no Firebase:', e)
+
+            try:
+                if hasattr(self, 'refresh_all'):
+                    self.refresh_all()
+                QMessageBox.information(dlg, 'Sucesso', 'Agendamento cancelado com sucesso.')
+                dlg.accept()
+            except Exception:
+                pass
+
+        def parse_date(s):
+            s = (s or "").strip()
+            if not s: return None
+            try:
+                return dt.datetime.strptime(s, "%d/%m/%Y").date()
+            except:
+                return None
+
+        def do_save():
+            nome = (ed_nome.text() or "").strip()
+            genero = (cb_genero.currentText() or "").strip()
+            ci_date = parse_date(ed_check_in.text())
+            co_date = parse_date(ed_check_out.text())
+            obs = (ed_obs.text() or "").strip()
+
+            email_val = (ed_email.text() or "").strip()
+            if not email_val:
+                QMessageBox.warning(dlg, "E-mail obrigatório",
+                                    "Informe um e-mail válido para enviar a confirmação.")
+                ed_email.setFocus()
+                return
+
+            if not (nome and ci_date and co_date):
+                QMessageBox.warning(dlg, "Campos",
+                                    "Preencha Nome, Check-in e Check-out corretamente.")
+                return
+            if co_date < ci_date:
+                QMessageBox.warning(dlg, "Datas",
+                                    "Check-out não pode ser anterior ao Check-in.")
+                return
+            exclude = sel_idx if mode == "edit" else None
+            if c.find_overlap(ci_date, co_date, exclude_idx=exclude) is not None:
+                QMessageBox.warning(dlg, "Conflito", "Existe sobreposição com outra reserva.")
+                return
+
+            # Gera código + horários
+            codigo = ''.join(secrets.choice(string.digits) for _ in range(6))
+            agora = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+
+            payload = {
+                "nome": nome, "genero": genero,
+                "matricula": ed_matricula.text(),
+                "gerencia": ed_gerencia.text(),
+                "contato": ed_contato.text(),
+                "centro_custo": ed_ccusto.text(),
+                "ppg_responsavel": ed_ppg_resp.text(),
+                "ppg_numero": ed_ppg_num.text(),
+                "check_in": ci_date.strftime("%d/%m/%Y"),
+                "check_out": co_date.strftime("%d/%m/%Y"),
+                "obs": obs,
+                "obs_blink": bool(obs),
+                "updated_by": self.usuario_ativo or "",
+                "updated_at": agora,
+                # Confirmação por código
+                "status_confirmacao": "PENDENTE",
+                "codigo_confirmacao": codigo,
+                "codigo_enviado_em": agora,
+                "codigo_validado_em": None,
+            }
+
+            payload.update({
+                "solicitante_reserva": (ed_solicitante.text() or "").strip(),
+                "email": email_val,
+                "status_confirmacao": "PENDENTE",  # <--- Importante
+                "codigo_confirmacao": codigo,
+                "codigo_enviado_em": agora,
+                "codigo_validado_em": None,
+            })
+
+            if mode == "new":
+                payload["created_at"] = agora
+                payload["operador_reserva"] = self.usuario_ativo or ""
+                c.add_reservation(payload)
+            else:
+                r = c.reservations[sel_idx]
+                payload["created_at"] = r.get("created_at", agora)
+                payload["operador_reserva"] = r.get("operador_reserva", "")
+                c.reservations[sel_idx] = payload
+
+            # --- DEFINE O STATUS INICIAL ---
+            # Sempre nasce AGENDADO (Azul), mesmo que seja para hoje, pois precisa do código
+            c.status = "AGENDADO"
+            c.last_modified_at = agora
+            c.last_action = "RESERVA" if mode == "new" else "EDIÇÃO RESERVA"
+
+            salvar_quartos_firebase(self.quartos)
+            print("[DEBUG] payload[email] =", payload.get("email"))
+
+            # Enviar código
+            try:
+                enviar_codigo_confirmacao(
+                    email=email_val,
+                    nome=payload.get("nome"),
+                    codigo=codigo,
+                    quarto=q.number,
+                    cama=c.idx
+                )
+            except Exception as e:
+                print("Erro ao enviar e-mail de confirmação:", e)
+                QMessageBox.warning(self, "E-mail", f"Falha no envio: {e}")
+
+            self.refresh_all()
+            dlg.accept()
+
+            try:
+                enviar_codigo_confirmacao(
+                    email=email_val,  # usa a variável segura
+                    nome=payload.get("nome"),
+                    codigo=codigo,
+                    quarto=q.number,
+                    cama=c.idx
+                )
+            except Exception as e:
+                print("Erro ao enviar e-mail de confirmação:", e)
+                QMessageBox.warning(self, "E-mail", f"Falha no envio: {e}")
+
+        btn_save.clicked.connect(do_save)
+        btn_cancel.clicked.connect(dlg.reject)
+        dlg.exec()
+
+    # === Diálogo de ações ===
+    def _center_dialog(self, dlg: QDialog, width=560, height=280):
+        dlg.resize(width, height)
+        dlg.setModal(True)
+        dlg.setStyleSheet(f"""
+        QDialog QLabel {{ color: {Theme.TEXT}; font-size: 14px; }}
+        QDialog QPushButton {{
+            background: {Theme.PRIMARY};
+            color: white;
+            border: 1px solid {Theme.BORDER_SOFT};
+            padding: 8px 12px;
+            border-radius: 10px;
+            font-weight: 700;
+        }}
+        QDialog QPushButton:hover {{ background: {Theme.PRIMARY_HOVER}; }}
+        QDialog QFrame {{
+            background: {Theme.SURFACE};
+            border: 1px solid {Theme.BORDER_SOFT};
+            border-radius: 12px;
+        }}
+        """)
+
+    def _install_close_mark_offline(self):
+        def _closeEvent(ev):
+            try:
+                if hasattr(self, 'auto_timer') and self.auto_timer.isActive(): self.auto_timer.stop()
+            except:
+                pass
+            try:
+                if hasattr(self, 'banner_timer') and self.banner_timer.isActive(): self.banner_timer.stop()
+            except:
+                pass
+            try:
+                if self.usuario_ativo:
+                    atualizar_status_usuario(self.usuario_ativo, "offline")
+            except:
+                pass
+            ev.accept()
+
+        self.closeEvent = _closeEvent
+
+    # === Mapa de Reservas ===
+    def status_color_mapa(self, status):
+        if status == "RESERVADO": return Theme.ACCENT
+        if status == "LIMPEZA": return Theme.SUCCESS
+        if status == "INTERDITADO": return Theme.WARNING
+        if status == "AGENDADO": return Theme.SCHEDULED
+        return Theme.NEUTRAL
+
+    def _mapear_reservas_para_dias(self, dias, nomes_limit=2):
+        mapa = {}
+        for q in self.quartos.values():
+            for c in q.camas.values():
+                for r in c.reservations:
+                    try:
+                        ci = dt.datetime.strptime(r["check_in"], "%d/%m/%Y").date()
+                        co = dt.datetime.strptime(r["check_out"], "%d/%m/%Y").date()
+                    except:
+                        continue
+                    for dia in dias:
+                        if ci <= dia <= co:
+                            chave = (q.number, dia)
+                            nm = r.get("nome", "")
+                            if chave in mapa:
+                                nomes = mapa[chave]["nomes"]
+                                if nm and nm not in nomes and len(nomes) < nomes_limit:
+                                    nomes.append(nm)
+                            else:
+                                mapa[chave] = {"status": "RESERVADO", "nomes": [nm] if nm else []}
+        return mapa
+
+    def refresh_mapa_from_model(self):
+        # limpar grid
+        while self.map_grid.count():
+            item = self.map_grid.takeAt(0)
+            w = item.widget()
+            if w: w.deleteLater()
+        hoje = dt.date.today()
+        dias_count = int(self.config.get("map_days", 7))
+        nomes_limit = int(self.config.get("show_map_names_limit", 2))
+        dias = [hoje + dt.timedelta(days=i) for i in range(dias_count)]
+        # cabeçalho
+        hdr = QLabel("Quarto");
+        hdr.setStyleSheet("font-weight:800;")
+        self.map_grid.addWidget(hdr, 0, 0)
+        for col, dia in enumerate(dias, start=1):
+            hd = QLabel(dia.strftime("%d/%m"));
+            hd.setStyleSheet("font-weight:800;")
+            self.map_grid.addWidget(hd, 0, col)
+        self.map_grid.setHorizontalSpacing(8)
+        self.map_grid.setVerticalSpacing(8)
+        # dados
+        quartos_numeros = sorted(self.quartos.keys(), key=lambda x: int(x))
+        reservas = self._mapear_reservas_para_dias(dias, nomes_limit)
+        for row, qnum in enumerate(quartos_numeros, start=1):
+            self.map_grid.addWidget(QLabel(f"Quarto {int(qnum):02d}"), row, 0)
+            for col, dia in enumerate(dias, start=1):
+                cell = QFrame()
+                cell.setStyleSheet(
+                    f"background:{Theme.SURFACE}; border: 1px solid {Theme.BORDER_SOFT}; border-radius:10px;")
+                lay = QVBoxLayout(cell);
+                lay.setContentsMargins(8, 8, 8, 8);
+                lay.setSpacing(4)
+                info = reservas.get((qnum, dia), None)
+                if info:
+                    bar = QFrame();
+                    bar.setFixedHeight(8)
+                    bar.setStyleSheet(f"background:{self.status_color_mapa(info['status'])}; border-radius:4px;")
+                    lay.addWidget(bar)
+                    nomes_txt = " / ".join(info["nomes"])
+                    if nomes_txt:
+                        lbl = QLabel(nomes_txt);
+                        lbl.setStyleSheet("font-size:12px;")
+                        lay.addWidget(lbl)
+                self.map_grid.addWidget(cell, row, col)
+
+        # >>> Opcional: largura mínima para rolagem horizontal conforme número de dias <<<
+        cols_count = int(self.config.get("map_days", 7)) + 1
+        cell_min_width = 140
+        try:
+            self.map_container.setMinimumWidth(cols_count * cell_min_width)
+        except Exception:
+            pass
+
+    # === KPIs & ALERTA ===
+    def update_kpis(self):
+        quartos = list(self.quartos.values())
+        camas = [c for q in quartos for c in q.camas.values()]
+        total_vagas = len(camas)
+        total_quartos = len(quartos)
+        vagas_ocupadas = sum(1 for c in camas if c.reserved)
+        # Vagas livres com opção de excluir quartos bloqueados
+        excludes_blocked = bool(self.config.get("kpi_count_free_excludes_blocked", False))
+        blocked_numbers = {q.number for q in quartos if self._is_room_blocked(q)}
+        vagas_livres = 0
+        for q in quartos:
+            for c in q.camas.values():
+                if c.available and (not excludes_blocked or q.number not in blocked_numbers):
+                    vagas_livres += 1
+        quartos_ocupados = sum(1 for q in quartos if any(c.reserved for c in q.camas.values()))
+        quartos_parcialmente = sum(
+            1 for q in quartos
+            if any(c.reserved for c in q.camas.values()) and any(c.available for c in q.camas.values())
+        )
+        # Bloqueio conforme política
+        quartos_bloqueados = sum(1 for q in quartos if self._is_room_blocked(q))
+        # Quartos INDISPONÍVEIS (ocupados OU bloqueados)
+        quartos_indisponiveis = 0
+        for q in quartos:
+            tem_ocupado = any(c.reserved for c in q.camas.values())
+            tem_bloqueado = self._is_room_blocked(q)
+            if tem_ocupado or tem_bloqueado:
+                quartos_indisponiveis += 1
+        vals = {
+            "Vagas Ocupadas": vagas_ocupadas,
+            "Vagas Livres": vagas_livres,
+            "Quartos Parcialmente Ocupado": quartos_parcialmente,
+            "Quartos Bloqueados": quartos_bloqueados,
+            "Reservados": quartos_ocupados,
+        }
+        for k, v in vals.items():
+            self.kpi_labels[k].setText(str(v))
+        # Alerta usando quartos indisponíveis com limiar configurável
+        self._trigger_alert_if_needed(
+            indisponiveis_quartos=quartos_indisponiveis,
+            total_quartos=total_quartos,
+            ocupados=quartos_ocupados,
+            bloqueados=quartos_bloqueados
+        )
+
+    def _trigger_alert_if_needed(self, indisponiveis_quartos, total_quartos, ocupados, bloqueados):
+        if total_quartos <= 0:
+            self.badge_alert.hide()
+            self.alert_banner.setVisible(True)
+            self.banner_timer.stop()
+            return
+
+        threshold = float(self.config.get("alert_threshold_percent", 80)) / 100.0
+        perc = indisponiveis_quartos / total_quartos
+        livres = total_quartos - indisponiveis_quartos
+
+        if perc >= threshold:
+            # --- UI: mantém alerta visível ---
+            self.badge_alert.setText(f"⚠ Indisponíveis {perc * 100:.0f}%")
+            self.badge_alert.show()
+
+            if self.config.get("alert_banner", True):
+                self._last_alert_stats = {
+                    "total_quartos": total_quartos,
+                    "indisponiveis": indisponiveis_quartos,
+                    "ocupados": ocupados,
+                    "bloqueados": bloqueados,
+                    "livres": livres,
+                    "percent": f"{perc * 100:.1f}"
+                }
+                txt = (f"⛔ QUARTOS INDISPONÍVEIS: {indisponiveis_quartos}/{total_quartos} "
+                       f"({perc * 100:.1f}%) • Ocupados: {ocupados} • Bloqueados: {bloqueados} • Livres: {livres}")
+                self.alert_text.setText(txt)
+                self.alert_banner.setVisible(True)
+                if not self.banner_timer.isActive():
+                    self.banner_timer.start(900)
+
+            # --- Som / diálogo com cooldown (como já estava) ---
+            now = dt.datetime.now()
+            cooldown = int(self.config.get("alert_cooldown_sec", 600))
+            should_notify_popup = (self._last_occupancy_alert is None) or (
+                    (now - self._last_occupancy_alert).total_seconds() > cooldown
+            )
+            if should_notify_popup:
+                if self.config.get("alert_sound", True):
+                    try:
+                        QApplication.beep()
+                    except:
+                        pass
+                QMessageBox.warning(
+                    self, "Alerta de Ocupação",
+                    (f"A porcentagem de QUARTOS indisponíveis (ocupados ou bloqueados) atingiu {perc * 100:.1f}% "
+                     f"(Percentual: {threshold * 100:.0f}%).\n\n"
+                     f"• Total de quartos: {total_quartos}\n"
+                     f"• Indisponíveis: {indisponiveis_quartos}\n"
+                     f"• Ocupados: {ocupados}\n"
+                     f"• Bloqueados: {bloqueados}\n"
+                     f"• Livres: {livres}")
+                )
+                self._last_occupancy_alert = now
+
+            # --- NOVO: e-mail apenas uma vez por evento (edge-trigger) ---
+            try:
+
+                if bloqueados > 0 and not self._alert_email_sent:
+                    # Recalcula KPIs e cancelamentos no momento do alerta
+                    kpi = self._kpis_para_email()
+                    canc = self._cancellations_para_email()
+                    html = self._build_html_admin_email(kpi, canc)
+
+                    assunto = (
+                        f"Alerta/Relatório — {kpi['perc_indisponiveis_quartos']}% indisponíveis "
+                        f"(Quartos: {kpi['indisponiveis_quartos']}/{kpi['total_quartos']})"
+                    )
+
+                    # Envia para todos admins cadastrados com o HTML completo
+                    notificar_admins(assunto, html)
+
+                    # Marca como enviado para este ciclo de alerta
+                    self._alert_email_sent = True
+            except Exception as e:
+                print('[AdminEmail] erro ao notificar alerta:', e)
+
+        else:
+            # --- “Descida”: abaixo do limiar -> oculta UI e permite novo e-mail na próxima subida ---
+            self.badge_alert.hide()
+            self.alert_banner.setVisible(False)
+            self.banner_timer.stop()
+            # NOVO: resetar o edge-trigger para permitir novo envio na próxima subida
+            self._alert_email_sent = False
+
+    def refresh_desempenho(self):
+        quartos = list(self.quartos.values())
+        camas = [c for q in quartos for c in q.camas.values()]
+        total_vagas = len(camas);
+        total_quartos = len(quartos)
+        vagas_ocupadas = sum(1 for c in camas if c.reserved)
+        excludes_blocked = bool(self.config.get("kpi_count_free_excludes_blocked", False))
+        blocked_numbers = {q.number for q in quartos if self._is_room_blocked(q)}
+        vagas_livres = 0
+        for q in quartos:
+            for c in q.camas.values():
+                if c.available and (not excludes_blocked or q.number not in blocked_numbers):
+                    vagas_livres += 1
+        quartos_ocupados = sum(1 for q in quartos if any(c.reserved for c in q.camas.values()))
+        quartos_parcialmente = sum(
+            1 for q in quartos
+            if any(c.reserved for c in q.camas.values()) and any(c.available for c in q.camas.values())
+        )
+        quartos_bloqueados = sum(1 for q in quartos if self._is_room_blocked(q))
+
+        def setv(k, v):
+            self.lbl_resumo[k].setText(str(v))
+
+        setv("Total de Quartos", total_quartos)
+        setv("Total de Vagas", total_vagas)
+        setv("Vagas Ocupadas", vagas_ocupadas)
+        setv("Vagas Livres", vagas_livres)
+        setv("Quartos Parcialmente Ocupado", quartos_parcialmente)
+        setv("Quartos Bloqueados", quartos_bloqueados)
+        setv("Reservados", quartos_ocupados)
+        self.tbl.setRowCount(0)
+        for q in quartos:
+            for c in q.camas.values():
+                for r in c.reservations:
+                    rix = self.tbl.rowCount();
+                    self.tbl.insertRow(rix)
+                    self.tbl.setItem(rix, 0, QTableWidgetItem(f"{q.number} • {c.idx}"))
+                    self.tbl.setItem(rix, 1, QTableWidgetItem(r.get("nome", "")))
+                    self.tbl.setItem(rix, 2, QTableWidgetItem(r.get("matricula", "")))
+                    self.tbl.setItem(rix, 3, QTableWidgetItem(r.get("gerencia", "")))
+
+                    # --- Valores vindos da antiga aba Relatórios, agora exibidos em Desempenho ---
+                    # Quartos Ocupados (diário) e Leitos Ocupados (diário)
+
+                    # Quartos Ocupados (diário) e Leitos Ocupados (diário)
+                    ocupados_q = sum(1 for q in quartos if any(c.reserved for c in q.camas.values()))
+                    camas = [c for q in quartos for c in q.camas.values()]
+                    leitos_ocupados = sum(1 for c in camas if c.reserved)
+
+                    # Gerências Usuárias
+                    gs = set()
+                    for q in quartos:
+                        for c in q.camas.values():
+                            for res in c.reservations:
+                                gs.add(res.get("gerencia", "N/A"))
+                    ger_list = sorted([g for g in gs if (g or "").strip()])
+                    max_show = 6
+                    if not ger_list:
+                        txt_ger = "—"
+                    elif len(ger_list) <= max_show:
+                        txt_ger = ", ".join(ger_list)
+                    else:
+                        txt_ger = ", ".join(ger_list[:max_show]) + f" … (+{len(ger_list) - max_show})"
+                    self.lbl_perf_extra["Gerências Usuárias"].setText(txt_ger)
+
+                    # Percentual Sexo (ativos hoje)
+                    masc = fem = 0
+                    today = dt.date.today()
+                    for q in quartos:
+                        for c in q.camas.values():
+                            _, ar = c.get_active_reservation(today)
+                            if ar:
+                                g = (ar.get("genero", "") or "").lower()
+                                if g.startswith("fem"):
+                                    fem += 1
+                                elif g.startswith("mas"):
+                                    masc += 1
+                    total_sf = masc + fem
+                    if total_sf == 0:
+                        self.lbl_perf_extra["Percentual"].setText("♂ 0% \n ♀ 0%")
+                    else:
+                        self.lbl_perf_extra["Percentual"].setText(
+                            f"♂ {masc / total_sf * 100:.1f}% \n ♀ {fem / total_sf * 100:.1f}%")
+
+    # === Observações (utilitário usado pelo badge) ===
+    def show_obs_quarto(self, q: Quarto):
+        items = []
+        for c in q.camas.values():
+            for idx, r in enumerate(c.reservations):
+                text = (r.get("obs", "").strip())
+                if text:
+                    blink = bool(r.get("obs_blink", False))
+                    items.append((c, idx, text, blink))
+        if not items:
+            QMessageBox.information(self, "Observações", f"Quarto {q.number} não possui observações.");
+            return
+        dlg = QDialog(self);
+        dlg.setWindowTitle(f"Observações — Quarto {q.number}")
+        self._center_dialog(dlg, 640, 420)
+        lay = QVBoxLayout(dlg);
+        lay.setContentsMargins(16, 16, 16, 16);
+        lay.setSpacing(12)
+        lay.addWidget(QLabel(f"Quarto {q.number}"))
+        card = QFrame();
+        add_soft_shadow(card)
+        cbox = QVBoxLayout(card);
+        cbox.setContentsMargins(12, 12, 12, 12);
+        cbox.setSpacing(8)
+        for c, idx, text, blink in items:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"Cama {c.idx} • Reserva {idx:02d}"))
+            row.addWidget(QLabel(text))
+            btn_stop = QPushButton("Parar piscar");
+            btn_start = QPushButton("Retomar piscar")
+
+            def make_handlers(c=c, idx=idx):
+                def stop():
+                    c.reservations[idx]["obs_blink"] = False;
+                    salvar_quartos_firebase(self.quartos);
+                    self.refresh_all()
+
+                def start():
+                    if not (c.reservations[idx].get("obs") or "").strip():
+                        QMessageBox.warning(self, "Observação", "Não há observação para piscar.");
+                        return
+                    c.reservations[idx]["obs_blink"] = True;
+                    salvar_quartos_firebase(self.quartos);
+                    self.refresh_all()
+
+                return stop, start
+
+            stp, sta = make_handlers()
+            btn_stop.clicked.connect(stp);
+            btn_start.clicked.connect(sta)
+            row.addWidget(btn_stop);
+            row.addWidget(btn_start);
+            cbox.addLayout(row)
+        lay.addWidget(card)
+        footer = QHBoxLayout();
+        footer.addStretch(1);
+        close = QPushButton("Fechar");
+        close.clicked.connect(dlg.accept)
+        footer.addWidget(close);
+        lay.addLayout(footer)
+        dlg.exec()
+
+    # === Relatórios ===
+
+    def _fmt_brl(self, value: float) -> str:
+        # Formata moeda R$ com separador de milhar e 2 casas
+        try:
+            return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        except Exception:
+            return f"{value:.2f}"
+
+    def refresh_relatorios(self):
+        # --- TOP 10 (ranking persistente) ---
+        self.tbl_top10.setRowCount(0)
+        top10 = top10_from_ranking(self.ranking)
+        if not top10:
+            self.tbl_top10.setRowCount(1)
+            self.tbl_top10.setSpan(0, 0, 1, 4)
+            self.tbl_top10.setItem(0, 0, QTableWidgetItem("— Ainda sem dados persistentes —"))
+        else:
+            for i, (nome, ger, count) in enumerate(top10, start=1):
+                r = self.tbl_top10.rowCount()
+                self.tbl_top10.insertRow(r)
+                self.tbl_top10.setItem(r, 0, QTableWidgetItem(f"{i:02d}"))
+                self.tbl_top10.setItem(r, 1, QTableWidgetItem(nome))
+                self.tbl_top10.setItem(r, 2, QTableWidgetItem(ger))
+                it_cnt = QTableWidgetItem(str(count))
+                it_cnt.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.tbl_top10.setItem(r, 3, it_cnt)
+
+        # --- KITS (últimas liberações) ---
+        self.tbl_kits.setRowCount(0)
+        total_kits = 0
+        total_val = 0.0
+        lines = []
+        for e in self.historico[-50:]:
+            if not isinstance(e, dict):
+                continue
+            nome = e.get("nome", "")
+            ger = e.get("gerencia", "")
+            kits = int(e.get("kits_qty", 0) or 0)
+            val = float(e.get("kits_total_value", 0.0) or 0.0)
+            if kits == 0 and val == 0.0:
+                continue
+            lines.append((nome, ger, kits, val))
+            total_kits += kits
+            total_val += val
+
+        if not lines:
+            self.tbl_kits.setRowCount(1)
+            self.tbl_kits.setSpan(0, 0, 1, 4)
+            self.tbl_kits.setItem(0, 0, QTableWidgetItem("— Sem liberações com cálculo de kits —"))
+        else:
+            for (nome, ger, kits, val) in lines:
+                r = self.tbl_kits.rowCount()
+                self.tbl_kits.insertRow(r)
+                self.tbl_kits.setItem(r, 0, QTableWidgetItem(nome))
+                self.tbl_kits.setItem(r, 1, QTableWidgetItem(ger))
+                it_kits = QTableWidgetItem(str(kits))
+                it_kits.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.tbl_kits.setItem(r, 2, it_kits)
+                it_val = QTableWidgetItem(f"R$ {self._fmt_brl(val)}")
+                it_val.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.tbl_kits.setItem(r, 3, it_val)
+
+        # Totais no rodapé
+        self.lbl_total_kits.setText(f"Total de Kits: {total_kits}")
+        self.lbl_total_val.setText(f"Valor Total: R$ {self._fmt_brl(total_val)}")
+
+    def copiar_relatorios(self):
+        texto = f"""
+    RELATÓRIO DE HOSPEDAGEM - {dt.datetime.now().strftime('%d/%m/%Y %H:%M')}
+    Gerado por: {self.usuario_ativo or ''}
+
+    {self.txt_freq.toPlainText()}
+    {self.txt_kits.toPlainText()}
+    """.strip()
+        QApplication.clipboard().setText(texto)
+        QMessageBox.information(self, "Copiado", "✅ Relatórios copiados para a área de transferência!")
+
+    # === Exportação Excel completa ===
+    def gerar_relatorio_completo(self):
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, numbers
+        from openpyxl.utils import get_column_letter
+        import datetime as dt
+
+        wb = Workbook()
+
+        def format_header(ws):
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center")
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+
+        def autosize(ws):
+            for col in ws.columns:
+                max_len = 0
+                col_letter = get_column_letter(col[0].column)
+                for cell in col:
+                    val = str(cell.value) if cell.value is not None else ""
+                    max_len = max(max_len, len(val))
+                ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
+
+        # cálculos auxiliares:
+        intervals = self._collect_intervals()
+        daily = self._build_daily_occupancy(intervals)
+        total_beds = self._all_bed_count()
+        months_calc = {}
+        if daily and total_beds > 0:
+            first_day = min(daily.keys());
+            last_day = max(daily.keys())
+            cursor = dt.date(first_day.year, first_day.month, 1)
+            end_cursor = dt.date(last_day.year, last_day.month, 1)
+            while cursor <= end_cursor:
+                mk = self._month_key(cursor)
+                months_calc[mk] = {"occupied_bed_days": 0, "days": self._days_in_month(cursor.year, cursor.month)}
+                cursor = dt.date(cursor.year + (1 if cursor.month == 12 else 0),
+                                 1 if cursor.month == 12 else cursor.month + 1, 1)
+            for d, occ in daily.items():
+                mk = self._month_key(d)
+                if mk in months_calc:
+                    months_calc[mk]["occupied_bed_days"] += occ
+                # --- 1. ABA RESERVAS (ADICIONADO COLUNAS DE CÓDIGO) ---
+                ws_res = wb.active;
+                ws_res.title = "Reservas"
+                ws_res.append([
+                    "Quarto", "Cama", "Nome", "Gênero", "Matrícula", "Gerência",
+                    "Check-in", "Check-out",
+                    "Status Atual", "Status Confirmação",  # <--- Novo
+                    "Código Enviado Em", "Código Validado Em",  # <--- Novo
+                    "Contato", "Observação",
+                    "Criado Em", "Atualizado Em",
+                    "Liberado Em", "Permanência (h)",
+                    "Operador Reserva", "Validado Por (Usuário)"
+                ])
+
+                for q in self.quartos.values():
+                    for c in q.camas.values():
+                        for res in c.reservations:
+                            # Pega quem validou (geralmente é o last_action_by se a ação foi check-in)
+                            quem_validou = getattr(c, "last_action_by", "") if res.get(
+                                "status_confirmacao") == "CONFIRMADO" else ""
+
+                            ws_res.append([
+                                q.number, c.idx,
+                                res.get("nome", ""), res.get("genero", ""), res.get("matricula", ""),
+                                res.get("gerencia", ""),
+                                res.get("check_in", ""), res.get("check_out", ""),
+                                c.status,
+                                res.get("status_confirmacao", "ANTIGO"),  # Mostra se está PENDENTE ou CONFIRMADO
+                                res.get("codigo_enviado_em", ""),  # <--- Hora do envio
+                                res.get("codigo_validado_em", ""),  # <--- Hora da validação
+                                res.get("contato", ""),
+                                res.get("obs", ""),
+                                res.get("created_at", ""), res.get("updated_at", ""),
+                                c.released_at, c.last_stay_duration_hours,
+                                res.get("operador_reserva", ""),
+                                quem_validou
+                            ])
+                format_header(ws_res);
+                autosize(ws_res)
+
+        #         autosize(ws_hist)
+
+        # Cadastro
+        base = {}
+        for e in self.historico:
+            if not isinstance(e, dict): continue
+            key = (e.get("nome", ""), e.get("gerencia", ""), e.get("matricula", ""))
+            base[key] = {
+                "genero": base.get(key, {}).get("genero", ""),
+                "ultimo_ci": e.get("check_in", ""),
+                "ultimo_co": e.get("check_out", ""),
+                "contato": base.get(key, {}).get("contato", ""),
+                "centro_custo": base.get(key, {}).get("centro_custo", ""),
+            }
+        for q in self.quartos.values():
+            for c in q.camas.values():
+                for res in c.reservations:
+                    key = (res.get("nome", ""), res.get("gerencia", ""), res.get("matricula", ""))
+                    base[key] = {
+                        "genero": res.get("genero", ""),
+                        "ultimo_ci": res.get("check_in", ""),
+                        "ultimo_co": res.get("check_out", ""),
+                        "contato": res.get("contato", ""),
+                        "centro_custo": res.get("centro_custo", ""),
+                    }
+        ws_cad = wb.create_sheet("Cadastro")
+        ws_cad.append(["Nome", "Gerência", "Matrícula", "Gênero", "Último Check-in", "Último Check-out", "Contato",
+                       "Centro de Custo"])
+        for (n, g, m), data in base.items():
+            ws_cad.append([n, g, m, data["genero"], data["ultimo_ci"], data["ultimo_co"], data.get("contato", ""),
+                           data.get("centro_custo", "")])
+        format_header(ws_cad);
+        autosize(ws_cad)
+
+        # Ocupação Mensal
+        ws_occ = wb.create_sheet("Ocupação Mensal")
+        ws_occ.append(["Mês (YYYY-MM)", "Leitos-dia ocupados", "Leitos-dia totais", "Taxa de Ocupação (%)"])
+        if months_calc and total_beds > 0:
+            for mk, info in sorted(months_calc.items()):
+                total_bed_days = total_beds * info["days"]
+                rate_percent = (info["occupied_bed_days"] / total_bed_days * 100) if total_bed_days > 0 else 0.0
+                ws_occ.append([mk, info["occupied_bed_days"], total_bed_days, rate_percent])
+        for row in ws_occ.iter_rows(min_row=2, min_col=4, max_col=4):
+            for cell in row:
+                if isinstance(cell.value, (int, float)):
+                    cell.value = cell.value / 100.0
+                cell.number_format = "0.00%"
+        format_header(ws_occ);
+        autosize(ws_occ)
+        # Resumo Geral
+        ws_sum = wb.create_sheet("Resumo Geral")
+        ws_sum.append(["Gerado por (usuário logado)", self.usuario_ativo or ""])
+        ws_sum.append(["Data/Hora de geração", dt.datetime.now().strftime("%d/%m/%Y %H:%M")])
+        ws_sum.append([])
+        quartos = list(self.quartos.values())
+        camas = [c for q in quartos for c in q.camas.values()]
+        total_quartos = len(quartos);
+        total_vagas = len(camas)
+        vagas_ocupadas = sum(1 for c in camas if c.reserved)
+        excludes_blocked = bool(self.config.get("kpi_count_free_excludes_blocked", False))
+        blocked_numbers = {q.number for q in quartos if self._is_room_blocked(q)}
+        vagas_livres = 0
+        for q in quartos:
+            for c in q.camas.values():
+                if c.available and (not excludes_blocked or q.number not in blocked_numbers):
+                    vagas_livres += 1
+        reservados_qtd_quartos = sum(1 for q in quartos if any(c.reserved for c in q.camas.values()))
+        quartos_parcialmente = sum(1 for q in quartos if any(c.reserved for c in q.camas.values()) and any(
+            c.available for c in q.camas.values()))
+        quartos_bloqueados = sum(1 for q in quartos if self._is_room_blocked(q))
+        perc_atual = (reservados_qtd_quartos / total_quartos) if total_quartos > 0 else 0.0
+        ws_sum.append(["Indicador", "Valor"])
+        ws_sum.append(["Total de Quartos", total_quartos])
+        ws_sum.append(["Total de Vagas", total_vagas])
+        ws_sum.append(["Vagas Ocupadas", vagas_ocupadas])
+        ws_sum.append(["Vagas Livres", vagas_livres])
+        ws_sum.append(["Quartos Parcialmente Ocupado", quartos_parcialmente])
+        ws_sum.append(["Quartos Bloqueados", quartos_bloqueados])
+        ws_sum.append(["Quartos com Reserva", reservados_qtd_quartos])
+        ws_sum.append(["Taxa de Ocupação Atual (%)", perc_atual])
+        total_kits_hist = 0;
+        total_kits_value = 0.0
+        for e in self.historico:
+            if not isinstance(e, dict): continue
+            total_kits_hist += (e.get("kits_qty", 0) or 0)
+            total_kits_value += (e.get("kits_total_value", 0.0) or 0.0)
+        ws_sum.append(["Total de Kits (Histórico)", total_kits_hist])
+        ws_sum.append(["Valor Total de Kits (R$)", round(total_kits_value, 2)])
+        total_rank = total_geral_ranking(self.ranking)
+        ws_sum.append(["Total Geral do Ranking (passagens)", total_rank])
+        ws_sum["B9"].number_format = "0.00%"
+        ws_sum["B11"].number_format = numbers.FORMAT_NUMBER_00
+        ws_sum["B12"].number_format = numbers.FORMAT_NUMBER_00
+        format_header(ws_sum);
+        autosize(ws_sum)
+        # Mapa Próx 5 Dias
+        ws_map = wb.create_sheet("Mapa Próx 5 Dias")
+        ws_map.append(["Data", "Reservas (até 3 por dia)"])
+        mapa = self.relatorios.mapa_reservas_proximos_5_dias()
+        for data, reservas in mapa.items():
+            resumo = " / ".join(reservas[:3]) if reservas else ""
+            ws_map.append([data, resumo])
+        format_header(ws_map);
+        autosize(ws_map)
+        # Página "Relatórios" consolidada
+        from openpyxl.styles import Font
+        ws_all = wb.create_sheet("Relatórios")
+        cur = 1
+
+        def title(text):
+            nonlocal cur
+            ws_all.cell(row=cur, column=1, value=text).font = Font(bold=True, size=12)
+            cur += 1
+
+        def write_table(headers, rows):
+            nonlocal cur
+            ws_all.append(headers)
+            for cell in ws_all[cur]: cell.font = Font(bold=True)
+            for row in rows: ws_all.append(row)
+            cur += 1 + len(rows)
+
+        title(f"RELATÓRIO DE HOSPEDAGEM — {dt.datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        write_table(["Info", "Valor"], [
+            ["Gerado por", self.usuario_ativo or ""],
+            ["Data/Hora", dt.datetime.now().strftime("%d/%m/%Y %H:%M")],
+        ])
+        cur += 1
+        title("Indicadores")
+        write_table(["Indicador", "Valor"], [
+            ["Total de Quartos", total_quartos],
+            ["Total de Vagas", total_vagas],
+            ["Vagas Ocupadas", vagas_ocupadas],
+            ["Vagas Livres", vagas_livres],
+            ["Quartos Parcialmente Ocupado", quartos_parcialmente],
+            ["Quartos Bloqueados", quartos_bloqueados],
+            ["Quartos com Reserva", reservados_qtd_quartos],
+            ["Taxa de Ocupação Atual (%)", f"{perc_atual * 100:.2f}%"],
+            ["Total de Kits (Histórico)", total_kits_hist],
+            ["Valor Total de Kits (R$)", f"{total_kits_value:.2f}"],
+            ["Total Geral do Ranking (passagens)", total_rank],
+        ])
+        cur += 1
+        title("Top 10 Hóspedes Mais Frequentes (Persistente)")
+        top10 = top10_from_ranking(self.ranking)
+        write_table(["Posição", "Nome", "Gerência", "Passagens"], [
+            [i + 1, nome, ger, count] for i, (nome, ger, count) in enumerate(top10)
+        ])
+        cur += 1
+        title("Histórico Detalhado (com Kits)")
+        hist_rows = []
+        for e in self.historico:
+            if not isinstance(e, dict): continue
+            hist_rows.append([
+                e.get("nome", ""), e.get("gerencia", ""), e.get("matricula", ""),
+                e.get("quarto", ""), e.get("cama", ""),
+                e.get("check_in", ""), e.get("check_out", ""),
+                e.get("released_at", ""), e.get("duracao_horas", ""),
+                e.get("days_reserved", ""), e.get("kits_qty", ""), e.get("kits_total_value", ""),
+                e.get("operador_liberacao", ""),
+            ])
+        write_table(
+            ["Nome", "Gerência", "Matrícula", "Quarto", "Cama", "Check-in", "Check-out", "Liberado Em", "Duração (h)",
+             "Dias", "Kits", "Valor Kits (R$)", "Operador Liberação"], hist_rows)
+        cur += 1
+        title("Cadastro")
+        cad_rows = []
+        for q in self.quartos.values():
+            for c in q.camas.values():
+                for res in c.reservations:
+                    cad_rows.append([
+                        res.get("nome", ""), res.get("gerencia", ""), res.get("matricula", ""),
+                        res.get("genero", ""), res.get("check_in", ""), res.get("check_out", ""),
+                        res.get("contato", ""), res.get("centro_custo", ""),
+                    ])
+        write_table(["Nome", "Gerência", "Matrícula", "Gênero", "Último Check-in", "Último Check-out", "Contato",
+                     "Centro de Custo"], cad_rows)
+        filename = f"relatorio_completo_{dt.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        try:
+            wb.save(filename)
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Relatório", f"✅ Relatório salvo com horários de validação:\n{filename}")
+        except Exception as e:
+            print(e)
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Erro", f"Erro ao salvar Excel: {e}")
+
+    def export_excel(self):
+        self.gerar_relatorio_completo()
+
+    # ==== Cálculos auxiliares para Excel ====
+    def _collect_intervals(self):
+        daily = {}
+        for q in self.quartos.values():
+            for c in q.camas.values():
+                for r in c.reservations:
+                    try:
+                        ci = dt.datetime.strptime(r.get("check_in", ""), "%d/%m/%Y").date()
+                        co = dt.datetime.strptime(r.get("check_out", ""), "%d/%m/%Y").date()
+                    except:
+                        continue
+                    d = ci
+                    while d <= co:
+                        daily[d] = daily.get(d, 0) + 1
+                        d += dt.timedelta(days=1)
+        return daily
+
+    def _build_daily_occupancy(self, daily_dict):
+        return daily_dict
+
+    def _all_bed_count(self):
+        return sum(len(q.camas) for q in self.quartos.values())
+
+    def _month_key(self, d: dt.date):
+        return f"{d.year:04d}-{d.month:02d}"
+
+    def _days_in_month(self, year, month):
+        if month == 12:
+            next_month = dt.date(year + 1, 1, 1)
+        else:
+            next_month = dt.date(year, month + 1, 1)
+        this_month = dt.date(year, month, 1)
+        return (next_month - this_month).days
+
+    # === Abas Admin ===
+    def _mount_user_tabs(self):
+        try:
+            if self.is_admin:
+                w_admin = UsersAdminWidget(self)
+                self.tabs.addTab(w_admin, "🛡️ Usuários Cadastrados")
+        except Exception as e:
+            print("Warn: não foi possível montar abas de usuários:", e)
+
+    def _mount_config_tab(self):
+        try:
+            cfg_widget = ConfigAdminWidget(self)
+            self.tabs.addTab(cfg_widget, "⚙️ Configurações")
+        except Exception as e:
+            print("Warn: não foi possível montar aba de configurações:", e)
+
+
+# ==== Backend Usuários (Outlook opcional) ====
+try:
+    import pythoncom
+    import win32com.client  # Outlook (Windows)
+
+    OUTLOOK_AVAILABLE = True
+except Exception as e:
+    print("[Outlook] indisponível:", e)
+    OUTLOOK_AVAILABLE = False
+USUARIOS_BASE = f"https://{_firebase_host()}/usuarios"
+
+
+def _usuarios_url(path_suffix=None):
+    base = USUARIOS_BASE if path_suffix is None else f"{USUARIOS_BASE}/{path_suffix}"
+    return _fb_url(base)
+
+
+def ler_usuarios_firebase():
+    try:
+        url = _usuarios_url()
+        resp = requests.get(url, timeout=10, verify=REQUESTS_VERIFY)
+        resp.raise_for_status()
+        dados = resp.json()
+        return dados if dados else {}
+    except Exception as e:
+        print(f"Erro ao ler usuarios: {e}")
+        return {}
+
+
+def salvar_usuario_firebase(usuario, senha, privilegio, email, nome_completo, identificacao, gerencia, empresa):
+    try:
+        dados = {
+            "usuario": usuario,
+            "senha": senha,
+            "privilegio": privilegio,
+            "email": email,
+            "nome_completo": nome_completo,
+            "identificacao": identificacao,
+            "gerencia": gerencia,
+            "empresa": empresa,
+            "status": "offline",
+            "criado_em": dt.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        }
+        url = _usuarios_url(usuario)
+        resp = requests.put(url, json=dados, timeout=10, verify=REQUESTS_VERIFY)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Erro ao salvar usuario: {e}")
+        return False
+
+
+def editar_usuario_firebase(usuario, nova_senha=None, novo_privilegio=None):
+    try:
+        payload = {}
+        if nova_senha is not None:
+            payload["senha"] = nova_senha
+        if novo_privilegio is not None:
+            payload["privilegio"] = novo_privilegio
+        if not payload:
+            return True
+        url = _usuarios_url(usuario)
+        resp = requests.patch(url, json=payload, timeout=10, verify=REQUESTS_VERIFY)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Erro ao editar usuario: {e}")
+        return False
+
+
+def excluir_usuario_firebase(usuario):
+    try:
+        url = _usuarios_url(usuario)
+        resp = requests.delete(url, timeout=10, verify=REQUESTS_VERIFY)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Erro ao excluir usuario: {e}")
+        return False
+
+
+def atualizar_status_usuario(usuario, status):
+    try:
+        url = _usuarios_url(usuario)
+        requests.patch(url, json={"status": status}, timeout=10, verify=REQUESTS_VERIFY)
+    except Exception as e:
+        print(f"Erro ao atualizar status do usuário: {e}")
+
+
+def autenticar(usuario, senha):
+    usuarios = ler_usuarios_firebase()
+    u = (usuario or "").strip().upper()
+    if u in usuarios and (usuarios[u].get("senha") == senha):
+        return True, usuarios[u].get("privilegio", "usuario"), usuarios[u].get("gerencia", "SOP/ARM")
+    return False, None, None
+
+
+def gerar_senha_temporaria():
+    letras = ''.join(secrets.choice(string.ascii_uppercase) for _ in range(2))
+    bloco1 = ''.join(secrets.choice(string.digits) for _ in range(2))
+    bloco2 = ''.join(secrets.choice(string.digits) for _ in range(4))
+    return f"SOP-{letras}{bloco1}-{bloco2}"
+
+
+def enviar_email_outlook(destinatario, assunto, corpo_html):
+    if not OUTLOOK_AVAILABLE:
+        print("[Outlook] indisponível. Instale pywin32 e use Windows com Outlook.")
+        return False
+    try:
+        pythoncom.CoInitialize()
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        mail = outlook.CreateItem(0)
+        mail.To = destinatario
+        mail.Subject = assunto
+        mail.HTMLBody = corpo_html
+        mail.Send()
+        return True
+    except Exception as e:
+        print(f"Erro no envio de e-mail: {e}")
+        return False
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except:
+            pass
+
+
+def listar_admin_emails():
+    """Retorna lista de e-mails dos usuários com privilegio 'admin'"""
+    try:
+        usuarios = ler_usuarios_firebase() or {}
+        emails = []
+        for u, info in usuarios.items():
+            priv = (info.get('privilegio', 'usuario') or 'usuario').lower()
+            mail = (info.get('email') or '').strip()
+            if priv == 'admin' and mail:
+                emails.append(mail)
+        return emails
+    except Exception as e:
+        print('[AdminEmail] erro ao listar admins:', e)
+        return []
+
+
+def notificar_admins(assunto: str, corpo_html: str):
+    """Envia e-mail para todos administradores (via Outlook se disponível).
+    Se Outlook não estiver disponível, apenas loga no console."""
+    admins = listar_admin_emails()
+    if not admins:
+        print('[AdminEmail] Sem admins com e-mail cadastrado.')
+        return False
+    ok_all = True
+    for dest in admins:
+        if OUTLOOK_AVAILABLE:
+            sent = enviar_email_outlook(dest, assunto, corpo_html)
+            ok_all = ok_all and bool(sent)
+        else:
+            print(f'[AdminEmail] (simulação) To={dest} Subject={assunto}')
+    return ok_all
+
+
+# --- dentro do mesmo módulo onde já existe enviar_codigo_confirmacao ---
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+
+def enviar_codigo_confirmacao(email, nome, codigo, quarto, cama):
+    """
+    Envia o código de confirmação.
+    Prioridade 1: Outlook Local (não requer senha no .env).
+    Prioridade 2: SMTP (fallback caso o Outlook falhe ou não exista).
+    """
+    import os
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    # 1. Monta o conteúdo do E-mail (HTML)
+    assunto = "Código de confirmação da reserva"
+
+    html = f"""
+    <div style="font-family:Segoe UI, Arial;">
+        <h2>Confirmação de Reserva</h2>
+        <p>Olá <strong>{nome}</strong>,</p>
+
+        <p>Seu código de confirmação é:</p>
+
+        <div style="
+            font-size:24px;
+            font-weight:800;
+            letter-spacing:4px;
+            background:#F3F4F6;
+            display:inline-block;
+            padding:12px 20px;
+            border-radius:8px;
+        ">
+            {codigo}
+        </div>
+
+        <p>
+            Reserva: <br>
+            <strong>Quarto {quarto} — Cama {cama}</strong>
+        </p>
+
+        <p style="color:#6B7280;">
+            Esse código é necessário para confirmar sua reserva.
+        </p>
+    </div>
+    """
+
+    # 2. TENTATIVA VIA OUTLOOK (Prioridade - Sem senha)
+    if OUTLOOK_AVAILABLE:
+        print(f"[Email] Tentando enviar código para {email} via Outlook Local...")
+        try:
+            sucesso = enviar_email_outlook(email, assunto, html)
+            if sucesso:
+                print("[Email] ✅ Sucesso via Outlook!")
+                return  # <--- Sai aqui se funcionar, ignorando SMTP
+        except Exception as e:
+            print(f"[Email] ⚠️ Falha ao tentar Outlook: {e}. Tentando fallback SMTP...")
+    else:
+        print("[Email] Outlook local não disponível. Indo para SMTP...")
+
+    # 3. TENTATIVA VIA SMTP (Fallback - Requer .env)
+    smtp_host = os.getenv("SMTP_HOST") or "smtp.office365.com"
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASS")
+
+    # Tratamento da porta
+    try:
+        smtp_port = int(os.getenv("SMTP_PORT") or 587)
+    except:
+        smtp_port = 587
+
+    # Se não tiver credenciais, apenas avisa e desiste (não trava o app)
+    if not smtp_user or not smtp_pass:
+        print("[Email] ❌ Erro: Outlook falhou/inexistente e credenciais SMTP não configuradas no .env.")
+        return
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = assunto
+    msg["From"] = smtp_user
+    msg["To"] = email
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        print("[Email] ✅ Sucesso via SMTP!")
+    except Exception as e:
+        print(f"[Email] ❌ Erro fatal no envio SMTP: {e}")
+        # Opcional: Levantar um alerta visual no Qt aqui se desejar
+
+
+def ensure_master_admin():
+    usuarios = ler_usuarios_firebase()
+    if "EZII" not in usuarios:
+        ok = salvar_usuario_firebase("EZII", "EZII", "admin",
+                                     email="master@empresa.com",
+                                     nome_completo="Master Admin",
+                                     identificacao="",
+                                     gerencia="ADMIN",
+                                     empresa="SOP")
+        print("Master admin criado:", ok)
+    else:
+        info = usuarios["EZII"]
+        if info.get("privilegio") != "admin":
+            editar_usuario_firebase("EZII", novo_privilegio="admin")
+            print("Master admin promovido a admin.")
+        if info.get("senha") != "EZII":
+            editar_usuario_firebase("EZII", nova_senha="EZII")
+            print("Senha do master admin sincronizada.")
+
+
+# ==== UI: Cadastro ====
+class CreateUserWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        title = QLabel("Criar nova conta");
+        title.setStyleSheet("font-weight:800; font-size:16px;")
+        v.addWidget(title)
+        form = QFormLayout()
+        self.ed_nome = QLineEdit()
+        self.ed_email = QLineEdit()
+        self.ed_id = QLineEdit()
+        self.cb_ger = QComboBox();
+        self.cb_ger.addItems(["SOP/ARM", "SOP/SG", "Petrobras"])
+        self.ed_empresa = QLineEdit()
+        self.ed_login = QLineEdit()
+        self.ed_senha = QLineEdit();
+        self.ed_senha.setEchoMode(QLineEdit.Password)
+        self.ed_conf = QLineEdit();
+        self.ed_conf.setEchoMode(QLineEdit.Password)
+        form.addRow("Nome completo", self.ed_nome)
+        form.addRow("E-mail", self.ed_email)
+        form.addRow("Matrícula/RG/CPF", self.ed_id)
+        form.addRow("Gerência", self.cb_ger)
+        form.addRow("Empresa", self.ed_empresa)
+        form.addRow("Login (CHAVE Petrobras)", self.ed_login)
+        form.addRow("Senha", self.ed_senha)
+        form.addRow("Confirmar senha", self.ed_conf)
+        v.addLayout(form)
+        self.lbl_status = QLabel("");
+        v.addWidget(self.lbl_status)
+        btns = QHBoxLayout();
+        btns.addStretch(1)
+        self.btn_save = QPushButton("Cadastrar");
+        btns.addWidget(self.btn_save)
+        v.addLayout(btns)
+        self.btn_save.clicked.connect(self.do_create)
+
+    def do_create(self):
+        nome = (self.ed_nome.text() or "").strip()
+        email = (self.ed_email.text() or "").strip()
+        ident = (self.ed_id.text() or "").strip()
+        ger = (self.cb_ger.currentText() or "").strip()
+        empresa = (self.ed_empresa.text() or "").strip()
+        login = (self.ed_login.text() or "").strip().upper()
+        senha = (self.ed_senha.text() or "").strip()
+        conf = (self.ed_conf.text() or "").strip()
+        if not (nome and email and login and senha and conf and ger):
+            self.lbl_status.setText("Preencha todos os campos obrigatórios.")
+            return
+        if senha != conf:
+            self.lbl_status.setText("As senhas não coincidem.")
+            return
+        if len(senha) < 8:
+            self.lbl_status.setText("Use senha com pelo menos 8 caracteres.")
+            return
+        usuarios = ler_usuarios_firebase()
+        if login in usuarios:
+            self.lbl_status.setText("Este login já está em uso. Escolha outro.")
+            return
+        ok = salvar_usuario_firebase(login, senha, "pendente", email, nome, ident, ger, empresa)
+        if ok:
+            self.lbl_status.setText("Usuário cadastrado com sucesso! (aguardando aprovação)")
+            self.ed_nome.clear();
+            self.ed_email.clear();
+            self.ed_id.clear();
+            self.ed_empresa.clear()
+            self.ed_login.clear();
+            self.ed_senha.clear();
+            self.ed_conf.clear()
+            self.cb_ger.setCurrentIndex(0)
+        else:
+            self.lbl_status.setText("Erro ao cadastrar usuário.")
+
+
+class CreateUserDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cadastrar novo usuário")
+        self.resize(640, 420)
+        self.setModal(True)
+        self.setStyleSheet("""
+        QDialog { background: #F3F4F8; }
+        QLabel { color: #0F172A; }
+        QPushButton {
+            border: none; background: #2563EB; color: white;
+            padding: 8px 14px; border-radius: 10px; font-weight: 600;
+        }
+        QPushButton:hover { background: #1E40AF; }
+        """)
+        outer = QVBoxLayout(self);
+        outer.setContentsMargins(16, 16, 16, 16);
+        outer.setSpacing(12)
+        card = QFrame();
+        add_soft_shadow(card, blur=22, y_offset=4, alpha=45)
+        lay = QVBoxLayout(card);
+        lay.setContentsMargins(12, 12, 12, 12)
+        self.widget = CreateUserWidget(self)
+        lay.addWidget(self.widget)
+        outer.addWidget(card)
+        footer = QHBoxLayout();
+        footer.addStretch(1)
+        btn_close = QPushButton("Fechar")
+        btn_close.clicked.connect(self.accept)
+        footer.addWidget(btn_close)
+        outer.addLayout(footer)
+
+
+# ==== UI: Login ====
+class UnifiedAuthDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Autenticação — Sistema de Gestão")
+        self.setModal(True)
+        self.resize(680, 520)
+        self.setStyleSheet("""
+        QDialog {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #F8FAFC, stop:1 #EEF2F7);
+        }
+        QLabel { color: #0F172A; }
+        .brand { color: #1F2A44; font-weight: 800; letter-spacing: 0.3px; }
+        .subtitle{ color: #475569; }
+        QFrame#card {
+            background: #FFFFFF;
+            border: 1px solid rgba(0,0,0,0.07);
+            border-radius: 16px;
+        }
+        QLineEdit {
+            border: 1px solid rgba(0,0,0,0.12);
+            background: #FFFFFF;
+            padding: 12px 14px;
+            border-radius: 12px;
+            font-size: 14px;
+        }
+        QLineEdit:focus {
+            border: 1px solid rgba(37,99,235,0.45);
+            background: #FFFFFF;
+        }
+        QPushButton.primary {
+            background: #2563EB; color: white;
+            padding: 12px 18px; border-radius: 12px; font-weight: 700;
+            border: 1px solid rgba(0,0,0,0.06);
+        }
+        QPushButton.primary:hover { background: #1E40AF; }
+        QPushButton.secondary {
+            background: #10B981; color: white;
+            padding: 10px 16px; border-radius: 10px; font-weight: 700;
+        }
+        QPushButton.ghost {
+            background: transparent; color: #2563EB;
+            padding: 8px 12px; border-radius: 10px; font-weight: 700;
+            border: 1px solid rgba(37,99,235,0.25);
+        }
+        QPushButton.flat {
+            background: transparent; color: #1E293B;
+            padding: 6px 8px; border: none; font-weight: 600;
+        }
+        QPushButton.flat:hover { color: #0F172A; text-decoration: underline; }
+        """)
+        root = QVBoxLayout(self);
+        root.setContentsMargins(24, 24, 24, 24);
+        root.setSpacing(14)
+        brand_box = QVBoxLayout()
+        logo = QLabel("📮");
+        logo.setStyleSheet("font-size: 32px;");
+        logo.setAlignment(Qt.AlignCenter)
+        brand_box.addWidget(logo, alignment=Qt.AlignHCenter)
+        title = QLabel("SOP/SG • Sistema de Gestão de Hospedagem");
+        title.setProperty("class", "brand");
+        title.setAlignment(Qt.AlignCenter)
+        subtitle = QLabel("Acesse com sua CHAVE cadastrada para continuar");
+        subtitle.setProperty("class", "subtitle");
+        subtitle.setAlignment(Qt.AlignCenter)
+        brand_box.addWidget(title);
+        brand_box.addWidget(subtitle)
+        hdr = QHBoxLayout();
+        hdr.addStretch(1);
+        hdr.addLayout(brand_box);
+        hdr.addStretch(1)
+        root.addLayout(hdr)
+        card = QFrame();
+        card.setObjectName("card");
+        add_soft_shadow(card, blur=28, y_offset=6, alpha=40)
+        card_lay = QVBoxLayout(card);
+        card_lay.setContentsMargins(20, 20, 20, 20);
+        card_lay.setSpacing(14)
+        card_title = QLabel("Entrar");
+        card_title.setStyleSheet("font-weight:800; font-size:16px;")
+        card_lay.addWidget(card_title)
+        form = QFormLayout();
+        form.setContentsMargins(0, 0, 0, 0);
+        form.setSpacing(10)
+        self.ed_usuario = QLineEdit();
+        self.ed_usuario.setPlaceholderText("CHAVE cadastrada")
+        self.ed_senha = QLineEdit();
+        self.ed_senha.setPlaceholderText("Senha");
+        self.ed_senha.setEchoMode(QLineEdit.Password)
+        form.addRow("Usuário", self.ed_usuario);
+        form.addRow("Senha", self.ed_senha)
+        card_lay.addLayout(form)
+        self.lbl_status = QLabel("");
+        card_lay.addWidget(self.lbl_status)
+        actions_primary = QHBoxLayout()
+        self.btn_login = QPushButton("Entrar");
+        self.btn_login.setProperty("class", "primary");
+        self.btn_login.setMinimumHeight(44)
+        actions_primary.addWidget(self.btn_login, 1);
+        card_lay.addLayout(actions_primary)
+        actions_secondary = QHBoxLayout()
+        self.btn_create_entry = QPushButton("Cadastrar novo usuário");
+        self.btn_create_entry.setProperty("class", "secondary")
+        self.btn_forgot = QPushButton("Esqueci minha senha");
+        self.btn_forgot.setProperty("class", "ghost")
+        actions_secondary.addStretch(1)
+        actions_secondary.addWidget(self.btn_create_entry)
+        actions_secondary.addWidget(self.btn_forgot)
+        card_lay.addLayout(actions_secondary)
+        root.addWidget(card)
+        footer = QHBoxLayout();
+        footer.addStretch(1)
+        self.btn_close = QPushButton("Fechar");
+        self.btn_close.setProperty("class", "flat")
+        footer.addWidget(self.btn_close);
+        root.addLayout(footer)
+        self.usuario = None;
+        self.privilegio = None;
+        self.gerencia = None
+        self.btn_login.clicked.connect(self._do_login)
+        self.btn_forgot.clicked.connect(self._open_recovery)
+        self.btn_create_entry.clicked.connect(self._open_create_dialog)
+        self.btn_close.clicked.connect(self.reject)
+        self._install_shortcuts()
+        self.ed_usuario.setFocus()
+        self.setMinimumWidth(560)
+
+    def _open_create_dialog(self):
+        dlg = CreateUserDialog(self);
+        dlg.exec()
+
+    def _do_login(self):
+        u = (self.ed_usuario.text() or "").strip().upper()
+        s = (self.ed_senha.text() or "").strip()
+        if not u or not s:
+            self.lbl_status.setText("Preencha usuário e senha para continuar.")
+            return
+        ok, priv, ger = autenticar(u, s)
+        if not ok:
+            self.lbl_status.setText("Usuário ou senha incorretos.")
+            return
+        if (priv or "").lower() == "pendente":
+            self.lbl_status.setText("Sua conta ainda não foi aprovada. Aguarde o administrador.")
+            return
+        try:
+            atualizar_status_usuario(u, "online")
+        except Exception:
+            pass
+        self.usuario = u
+        self.privilegio = priv or "usuario"
+        self.gerencia = ger or "SOP/ARM"
+        self.accept()
+
+    def _open_recovery(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Recuperar senha")
+        dlg.resize(480, 260)
+        dlg.setModal(True)
+        dlg.setStyleSheet("""
+        QDialog { background: #FFFFFF; }
+        QLabel { color: #0F172A; }
+        QLineEdit {
+            border: 1px solid rgba(0,0,0,0.12);
+            background: #FFFFFF;
+            padding: 10px 12px;
+            border-radius: 10px;
+        }
+        QLineEdit:focus { border: 1px solid rgba(37,99,235,0.45); }
+        QPushButton.primary {
+            background: #2563EB; color: white;
+            padding: 10px 16px; border-radius: 10px; font-weight: 700;
+        }
+        QPushButton.primary:hover { background: #1E40AF; }
+        QPushButton.flat {
+            background: transparent; color: #1E293B;
+            padding: 6px 8px; border: none; font-weight: 600;
+        }
+        QPushButton.flat:hover { color: #0F172A; text-decoration: underline; }
+        """)
+        v = QVBoxLayout(dlg);
+        v.setContentsMargins(16, 16, 16, 16);
+        v.setSpacing(12)
+        v.addWidget(QLabel("Recuperar senha"))
+        form = QFormLayout()
+        ed_login = QLineEdit();
+        ed_login.setPlaceholderText("CHAVE cadastrada")
+        form.addRow("Login", ed_login)
+        v.addLayout(form)
+        lbl_result = QLabel("");
+        v.addWidget(lbl_result)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        btn_close = QPushButton("Fechar");
+        btn_close.setProperty("class", "flat")
+        btn_send = QPushButton("Enviar nova senha");
+        btn_send.setProperty("class", "primary")
+        actions.addWidget(btn_close);
+        actions.addWidget(btn_send)
+        v.addLayout(actions)
+
+        def do_send():
+            login = (ed_login.text() or "").strip().upper()
+            if not login:
+                lbl_result.setText("Informe o login (CHAVE cadastrada).")
+                return
+            usuarios = ler_usuarios_firebase()
+            if login not in usuarios:
+                lbl_result.setText("Usuário não encontrado.")
+                return
+            email_dest = (usuarios[login].get("email") or "").strip()
+            if not email_dest:
+                lbl_result.setText("Usuário sem e-mail cadastrado. Contate o administrador.")
+                return
+            nova = gerar_senha_temporaria()
+            ok = editar_usuario_firebase(login, nova_senha=nova)
+            if not ok:
+                lbl_result.setText("Erro ao atualizar senha no sistema.")
+                return
+            assunto = "Recuperação de senha - Sistema de Gestão"
+            corpo_html = (
+                "<p>Olá,</p>"
+                "<p>Você solicitou recuperação de senha no Sistema de Gestão.</p>"
+                f"<p><strong>Sua nova senha temporária:</strong> <code>{nova}</code></p>"
+                "<p>Por segurança, altere esta senha após o primeiro login.</p>"
+                "<p>Atenciosamente,<br>Equipe de Gestão</p>"
+            )
+            enviado = enviar_email_outlook(email_dest, assunto, corpo_html)
+            lbl_result.setText(
+                f"Senha temporária enviada para: {email_dest}" if enviado
+                else "Falha ao enviar e-mail. Verifique o Outlook."
+            )
+
+        btn_send.clicked.connect(do_send)
+        btn_close.clicked.connect(dlg.accept)
+        dlg.exec()
+
+    def _install_shortcuts(self):
+        def keyPressEvent(event):
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self._do_login()
+            elif event.key() == Qt.Key_Escape:
+                self.reject()
+            else:
+                QDialog.keyPressEvent(self, event)
+
+        self.keyPressEvent = keyPressEvent
+
+
+# ==== UI: Administração de usuários ====
+class UsersAdminWidget(QWidget):
+    """
+    Lista usuários com atualização em tempo real (5s):
+    - KPIs: Pendentes, Online e Offline
+    - Mostra nomes online/offline no topo
+    - Filtro por status (Todos/Online/Offline/Pendente)
+    - Botões de ação com ícone + texto (Salvar/Excluir)
+    - Edição de privilégio por linha (QComboBox)
+    - Destaque por status (verde/online, cinza/offline, amarelo/pendente)
+    - Campo de Nova Senha mais alto (40px), expansível e com mostrar/ocultar
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        header = QHBoxLayout()
+        title = QLabel("Usuários cadastrados");
+        title.setStyleSheet("font-weight:800; font-size:16px;")
+        header.addWidget(title);
+        header.addStretch(1)
+        v.addLayout(header)
+        # KPIs + listas
+        kpi = QVBoxLayout()
+        row_kpi = QHBoxLayout()
+        self.lbl_pend = QLabel("Pendentes: 0")
+        self.lbl_on = QLabel("Online: 0")
+        self.lbl_off = QLabel("Offline: 0")
+        row_kpi.addWidget(self.lbl_pend);
+        row_kpi.addSpacing(16)
+        row_kpi.addWidget(self.lbl_on);
+        row_kpi.addSpacing(16)
+        row_kpi.addWidget(self.lbl_off);
+        row_kpi.addStretch(1)
+        kpi.addLayout(row_kpi)
+        self.lbl_online_list = QLabel("🟢 Online agora: —");
+        self.lbl_online_list.setWordWrap(True)
+        self.lbl_offline_list = QLabel("⚪ Offline agora: —");
+        self.lbl_offline_list.setWordWrap(True)
+        kpi.addWidget(self.lbl_online_list);
+        kpi.addWidget(self.lbl_offline_list)
+        v.addLayout(kpi)
+        # Filtro por status
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filtro status:"))
+        self.cb_filter = QComboBox();
+        self.cb_filter.addItems(["Todos", "Online", "Offline", "Pendente"])
+        self.cb_filter.currentIndexChanged.connect(self.refresh)
+        filter_row.addStretch(1)
+        v.addLayout(filter_row)
+        # Tabela
+        self.tbl = QTableWidget(0, 8)
+        self.tbl.setHorizontalHeaderLabels(
+            ["Usuário", "Nome", "E-mail", "Privilégio", "Status", "Gerência", "Empresa", "Ações"])
+        v.addWidget(self.tbl)
+        hdr = self.tbl.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        for col in range(7):
+            hdr.setSectionResizeMode(col, QHeaderView.Interactive)
+        hdr.setSectionResizeMode(7, QHeaderView.Stretch)
+        # Timer realtime (5s)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(5_000)
+        self.refresh()
+
+    def _apply_row_style(self, row: int, status_text: str, privilegio_text: str):
+        status = (status_text or "").strip().lower()
+        priv = (privilegio_text or "").strip().lower()
+        color = None
+        if status == "online":
+            color = QColor(209, 250, 229)  # verde claro
+        elif status == "offline":
+            color = QColor(243, 244, 246)  # cinza claro
+        if priv == "pendente":
+            color = QColor(254, 249, 195)  # amarelo claro
+        if color:
+            for col in range(self.tbl.columnCount()):
+                item = self.tbl.item(row, col)
+                if item:
+                    item.setBackground(color)
+
+    def refresh(self):
+        usuarios = ler_usuarios_firebase() or {}
+        filter_val = (self.cb_filter.currentText() or "Todos").lower()
+        pendentes = [];
+        online = [];
+        offline = []
+        for u, info in usuarios.items():
+            st = (info.get("status", "offline") or "offline").lower()
+            priv = (info.get("privilegio", "usuario") or "usuario").lower()
+            if priv == "pendente":
+                pendentes.append(u)
+            if st == "online":
+                online.append(u)
+            else:
+                offline.append(u)
+        self.lbl_pend.setText(f"Pendentes: {len(pendentes)}")
+        self.lbl_on.setText(f"Online: {len(online)}")
+        self.lbl_off.setText(f"Offline: {len(offline)}")
+        self.lbl_online_list.setText("🟢 Online agora: " + (", ".join(sorted(online)) if online else "—"))
+        self.lbl_offline_list.setText("⚪ Offline agora: " + (", ".join(sorted(offline)) if offline else "—"))
+        self.tbl.setRowCount(0)
+        for u, info in usuarios.items():
+            stat = (info.get("status", "offline") or "offline").lower()
+            priv = (info.get("privilegio", "usuario") or "usuario").lower()
+            if filter_val == "online" and stat != "online":
+                continue
+            if filter_val == "offline" and stat != "offline":
+                continue
+            if filter_val == "pendente" and priv != "pendente":
+                continue
+            row = self.tbl.rowCount()
+            self.tbl.insertRow(row)
+            self.tbl.setItem(row, 0, QTableWidgetItem(u))
+            self.tbl.setItem(row, 1, QTableWidgetItem(info.get("nome_completo", "") or ""))
+            self.tbl.setItem(row, 2, QTableWidgetItem(info.get("email", "") or ""))
+            cb_priv = QComboBox();
+            cb_priv.addItems(["usuario", "admin", "pendente"]);
+            cb_priv.setCurrentText(priv)
+            self.tbl.setCellWidget(row, 3, cb_priv)
+            it_status = QTableWidgetItem(info.get("status", "offline") or "offline")
+            it_status.setForeground(QColor(22, 101, 52) if stat == "online" else QColor(71, 85, 105))
+            it_status.setTextAlignment(Qt.AlignCenter)
+            self.tbl.setItem(row, 4, it_status)
+            self.tbl.setItem(row, 5, QTableWidgetItem(info.get("gerencia", "") or ""))
+            self.tbl.setItem(row, 6, QTableWidgetItem(info.get("empresa", "") or ""))
+            # Ações: Nova senha + botões
+            w_actions = QWidget()
+            h = QHBoxLayout(w_actions);
+            h.setContentsMargins(4, 4, 4, 4);
+            h.setSpacing(8)
+            ed_senha = QLineEdit()
+            ed_senha.setPlaceholderText("Nova senha")
+            ed_senha.setEchoMode(QLineEdit.Password)
+            ed_senha.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            ed_senha.setMinimumWidth(160)
+            ed_senha.setMinimumHeight(40)  # altura maior
+            ed_senha.setStyleSheet("padding:10px 12px; border-radius:10px; font-size:14px;")
+            btn_eye = QToolButton()
+            btn_eye.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+            btn_eye.setToolTip("Mostrar/ocultar senha")
+
+            def toggle_eye():
+                ed_senha.setEchoMode(
+                    QLineEdit.Normal if ed_senha.echoMode() == QLineEdit.Password else QLineEdit.Password)
+
+            btn_eye.clicked.connect(toggle_eye)
+            btn_save = QToolButton()
+            btn_save.setText("Salvar")
+            btn_save.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+            btn_save.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            btn_save.setAutoRaise(True)
+            btn_save.setCursor(Qt.PointingHandCursor)
+            btn_save.setToolTip("Salvar alterações do usuário")
+            btn_del = QToolButton()
+            btn_del.setText("Excluir")
+            btn_del.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+            btn_del.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            btn_del.setAutoRaise(True)
+            btn_del.setCursor(Qt.PointingHandCursor)
+            btn_del.setToolTip("Excluir usuário")
+            h.addWidget(ed_senha)
+            h.addWidget(btn_eye)
+            h.addWidget(btn_save)
+            h.addWidget(btn_del)
+            h.addStretch(1)
+            h.setStretchFactor(ed_senha, 1)
+            self.tbl.setCellWidget(row, 7, w_actions)
+
+            def make_handlers(user=u, ed=ed_senha, cb=cb_priv):
+                def do_save():
+                    new_pass = ed.text().strip() or None
+                    new_priv = cb.currentText()
+                    if new_pass is not None and len(new_pass) < 8:
+                        QMessageBox.warning(self, "Senha", "A nova senha deve ter pelo menos 8 caracteres.")
+                        return
+                    ok = editar_usuario_firebase(user, nova_senha=new_pass, novo_privilegio=new_priv)
+                    QMessageBox.information(self, "Usuário",
+                                            "Usuário editado com sucesso!" if ok else "Erro ao editar usuário!")
+                    self.refresh()
+
+                def do_del():
+                    ok = excluir_usuario_firebase(user)
+                    QMessageBox.information(self, "Usuário", "Usuário excluído!" if ok else "Erro ao excluir usuário!")
+                    self.refresh()
+
+                return do_save, do_del
+
+            save_fn, del_fn = make_handlers()
+            btn_save.clicked.connect(save_fn)
+            btn_del.clicked.connect(del_fn)
+            self._apply_row_style(row, it_status.text(), cb_priv.currentText())
+
+    def force_refresh_data(self):
+        """Força o download dos dados do Firebase e atualiza todas as telas."""
+        try:
+            # Muda o texto do cursor/botão para dar feedback
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+
+            # 1. Baixa tudo do Firebase novamente
+            self.quartos = carregar_quartos_firebase()
+            self.historico = carregar_historico_firebase()
+            self.ranking = carregar_ranking()
+
+            # 2. Atualiza a tela
+            self.refresh_all()
+
+            QApplication.restoreOverrideCursor()
+            QMessageBox.information(self, "Sincronização", "✅ Dados atualizados com o servidor!")
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            print(f"Erro ao atualizar: {e}")
+            QMessageBox.warning(self, "Erro", "Falha ao baixar dados do servidor.")
+
+
+# ==== UI: Configurações (Admin) ====
+class ConfigAdminWidget(QWidget):
+    """
+    Aba de Configurações PROFISSIONAL:
+    - Alertas: limiar, modo, cooldown, som, banner
+    - KPIs: política de bloqueio de quarto e exclusão de vagas livres em bloqueados
+    - Mapa: dias exibidos e limite de nomes por célula
+    - Ações: Liberar TODOS, Bloquear TODOS, Recalcular status, Parar piscar OBS
+    """
+
+    def __init__(self, parent_app: HospedagemProQt):
+        super().__init__(parent_app)
+        self.app = parent_app
+        v = QVBoxLayout(self);
+        v.setContentsMargins(8, 8, 8, 8);
+        v.setSpacing(12)
+        title = QLabel("⚙️ Configurações do Sistema")
+        title.setStyleSheet("font-weight:800; font-size:16px;")
+        v.addWidget(title)
+        cfg = self.app.config
+        # Grupo Alertas
+        grp_alert = QGroupBox("🔔 Alertas")
+        f_alert = QFormLayout(grp_alert);
+        f_alert.setContentsMargins(12, 12, 12, 12);
+        f_alert.setSpacing(8)
+        self.sp_threshold = QSpinBox();
+        self.sp_threshold.setRange(50, 100);
+        self.sp_threshold.setSuffix(" %");
+        self.sp_threshold.setValue(int(cfg.get("alert_threshold_percent", 80)))
+        self.cb_mode = QComboBox();
+        self.cb_mode.addItems(["rooms_union", "rooms_occupied", "rooms_blocked", "beds"]);
+        self.cb_mode.setCurrentText(cfg.get("alert_mode", "rooms_union"))
+        self.sp_cooldown = QSpinBox();
+        self.sp_cooldown.setRange(60, 3600);
+        self.sp_cooldown.setSuffix(" s");
+        self.sp_cooldown.setValue(int(cfg.get("alert_cooldown_sec", 600)))
+        self.cb_sound = QCheckBox("Tocar beep ao disparar alerta");
+        self.cb_sound.setChecked(bool(cfg.get("alert_sound", True)))
+        self.cb_banner = QCheckBox("Mostrar banner detalhado");
+        self.cb_banner.setChecked(bool(cfg.get("alert_banner", True)))
+        f_alert.addRow("Percentual do alerta", self.sp_threshold)
+        f_alert.addRow("Modo do alerta", self.cb_mode)
+        f_alert.addRow("Cooldown entre alertas", self.sp_cooldown)
+        f_alert.addRow(self.cb_sound)
+        f_alert.addRow(self.cb_banner)
+        v.addWidget(grp_alert)
+        # Grupo KPIs
+        grp_kpi = QGroupBox("📊 KPIs")
+        f_kpi = QFormLayout(grp_kpi);
+        f_kpi.setContentsMargins(12, 12, 12, 12);
+        f_kpi.setSpacing(8)
+        self.cb_block_policy = QComboBox();
+        self.cb_block_policy.addItems(["any_bed", "both_beds"]);
+        self.cb_block_policy.setCurrentText(cfg.get("blocked_room_policy", "any_bed"))
+        self.cb_free_excl = QCheckBox("Não contar vagas livres em quartos bloqueados");
+        self.cb_free_excl.setChecked(bool(cfg.get("kpi_count_free_excludes_blocked", False)))
+        f_kpi.addRow("Política de quarto bloqueado", self.cb_block_policy)
+        f_kpi.addRow(self.cb_free_excl)
+        v.addWidget(grp_kpi)
+        # Grupo Mapa
+        grp_map = QGroupBox("🗺️ Mapa de Reservas")
+        f_map = QFormLayout(grp_map);
+        f_map.setContentsMargins(12, 12, 12, 12);
+        f_map.setSpacing(8)
+        self.sp_map_days = QSpinBox();
+        self.sp_map_days.setRange(3, 30);
+        self.sp_map_days.setValue(int(cfg.get("map_days", 7)))
+        self.sp_names_limit = QSpinBox();
+        self.sp_names_limit.setRange(1, 5);
+        self.sp_names_limit.setValue(int(cfg.get("show_map_names_limit", 2)))
+        self.sp_auto = QSpinBox();
+        self.sp_auto.setRange(5000, 120000);
+        self.sp_auto.setSuffix(" ms");
+        self.sp_auto.setValue(int(cfg.get("auto_refresh_ms", 30000)))
+        f_map.addRow("Dias exibidos no mapa", self.sp_map_days)
+        f_map.addRow("Nomes por célula", self.sp_names_limit)
+        f_map.addRow("Atualização automática", self.sp_auto)
+        v.addWidget(grp_map)
+        # Botão salvar
+        h = QHBoxLayout();
+        h.addStretch(1)
+        btn_save = QPushButton("Salvar Configurações");
+        h.addWidget(btn_save)
+        v.addLayout(h)
+
+        def do_save():
+            cfg_new = {
+                "alert_threshold_percent": int(self.sp_threshold.value()),
+                "alert_mode": self.cb_mode.currentText(),
+                "alert_cooldown_sec": int(self.sp_cooldown.value()),
+                "auto_refresh_ms": int(self.sp_auto.value()),
+                "alert_sound": bool(self.cb_sound.isChecked()),
+                "alert_banner": bool(self.cb_banner.isChecked()),
+                "blocked_room_policy": self.cb_block_policy.currentText(),
+                "kpi_count_free_excludes_blocked": bool(self.cb_free_excl.isChecked()),
+                "map_days": int(self.sp_map_days.value()),
+                "show_map_names_limit": int(self.sp_names_limit.value()),
+            }
+            ok = salvar_config(cfg_new)
+            if ok:
+                self.app.config = cfg_new
+                try:
+                    self.app.auto_timer.stop()
+                    self.app.auto_timer.start(int(cfg_new.get("auto_refresh_ms", 30000)))
+                except:
+                    pass
+                QMessageBox.information(self, "Configurações", "✅ Configurações salvas e aplicadas.")
+                self.app.update_kpis()
+                self.app.refresh_mapa_from_model()
+            else:
+                QMessageBox.warning(self, "Configurações", "❌ Erro ao salvar configurações.")
+
+        btn_save.clicked.connect(do_save)
+        # Grupo Ações em massa
+        grp_actions = QGroupBox("🛠️ Ações em Massa")
+        actions_row = QHBoxLayout(grp_actions);
+        actions_row.setSpacing(10)
+        btn_release_all = QPushButton("Liberar TODOS os quartos")
+        btn_block_all = QPushButton("Bloquear TODOS os quartos")
+        btn_recalc = QPushButton("Recalcular status por data")
+        btn_stop_obs = QPushButton("Parar piscar TODAS as OBS")
+        btn_release_all.setStyleSheet(
+            "background:#10B981; color:white; font-weight:700; padding:8px 12px; border-radius:10px;")
+        btn_block_all.setStyleSheet(
+            "background:#DC2626; color:white; font-weight:700; padding:8px 12px; border-radius:10px;")
+        btn_recalc.setStyleSheet(
+            "background:#2563EB; color:white; font-weight:700; padding:8px 12px; border-radius:10px;")
+        btn_stop_obs.setStyleSheet(
+            "background:#6B7280; color:white; font-weight:700; padding:8px 12px; border-radius:10px;")
+        actions_row.addWidget(btn_release_all)
+        actions_row.addWidget(btn_block_all)
+        actions_row.addWidget(btn_recalc)
+        actions_row.addWidget(btn_stop_obs)
+        v.addWidget(grp_actions)
+
+        def do_release_all():
+            ret = QMessageBox.question(self, "Liberar todos",
+                                       "Tem certeza que deseja liberar TODOS os quartos?\n(Reservas permanecem; status será ajustado por regra.)",
+                                       QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return
+            now_str = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+            today = dt.date.today()
+            total = 0
+            for q in self.app.quartos.values():
+                for c in q.camas.values():
+                    c.interditado_motivo = ""
+                    c.operador_liberacao = self.app.usuario_ativo or ""
+                    _, ar = c.get_active_reservation(today)
+                    if ar:
+                        c.status = "OCUPADO"
+                    else:
+                        _, nxt = c.get_next_reservation(today)
+                        c.status = "AGENDADO" if nxt else "DISPONÍVEL"
+                    c.last_modified_at = now_str
+                    total += 1
+            salvar_quartos_firebase(self.app.quartos)
+            self.app.refresh_all()
+            QMessageBox.information(self, "Liberar todos", f"✅ {total} camas/slots ajustados e liberados.")
+
+        def do_block_all():
+            motivo, ok = QInputDialog.getText(self, "Bloquear todos",
+                                              "Informe o motivo do bloqueio (aplicado em todos):")
+            if not ok:
+                return
+            motivo = (motivo or "").strip()
+            if not motivo:
+                QMessageBox.warning(self, "Bloquear todos", "Informe um motivo.")
+                return
+            ret = QMessageBox.question(self, "Bloquear todos",
+                                       "Tem certeza que deseja BLOQUEAR TODOS os quartos?\n(Reservas permanecem, mas o status fica INTERDITADO.)",
+                                       QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return
+            now_str = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
+            total = 0
+            for q in self.app.quartos.values():
+                for c in q.camas.values():
+                    c.status = "INTERDITADO"
+                    c.interditado_motivo = motivo
+                    c.operador_bloqueio = self.app.usuario_ativo or ""
+                    c.last_modified_at = now_str
+                    total += 1
+            salvar_quartos_firebase(self.app.quartos)
+            self.app.refresh_all()
+            QMessageBox.information(self, "Bloquear todos", f"⛔ {total} camas/slots bloqueados com motivo: {motivo}")
+
+        def do_recalc():
+            self.app.sync_status_by_date()
+            salvar_quartos_firebase(self.app.quartos)
+            self.app.refresh_all()
+            QMessageBox.information(self, "Recalcular", "✅ Status recalculado conforme datas de reserva.")
+
+        def do_stop_obs():
+            total = 0
+            for q in self.app.quartos.values():
+                for c in q.camas.values():
+                    for r in c.reservations:
+                        if r.get("obs_blink", False):
+                            r["obs_blink"] = False
+                            total += 1
+            salvar_quartos_firebase(self.app.quartos)
+            self.app.refresh_all()
+            QMessageBox.information(self, "Observações", f"✅ Parada de piscar aplicada em {total} observação(ões).")
+
+        btn_release_all.clicked.connect(do_release_all)
+        btn_block_all.clicked.connect(do_block_all)
+        btn_recalc.clicked.connect(do_recalc)
+        btn_stop_obs.clicked.connect(do_stop_obs)
+
+
+# ==== Fluxo principal ====
+if __name__ == "__main__":
+    ensure_master_admin()
+    app = QApplication(sys.argv)
+    while True:
+        auth = UnifiedAuthDialog()
+        if auth.exec() != QDialog.Accepted:
+            break
+        win = HospedagemProQt(usuario_ativo=auth.usuario, privilegio_usuario=(auth.privilegio or "usuario"))
+        win.show()
+        app.exec()
+    sys.exit(0)
